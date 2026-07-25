@@ -147,3 +147,6 @@ class CrawlStore:
                 "SELECT status, COUNT(*) AS count FROM listing_pages GROUP BY status"
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def save_document_outputs(self, document: object, paths: dict[str, Path]) -> None:
+        return None

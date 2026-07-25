@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import time
 from pathlib import Path
 from typing import Iterable
@@ -11,6 +12,7 @@ from .document import DocumentDownloader
 from .exporters import export_document
 from .http_client import PRGClient
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
+from .postgres_store import PostgresCrawlStore
 from .store import CrawlStore
 
 
@@ -61,7 +63,11 @@ class Crawler:
         self.force = force
         self.follow_links_depth = max(0, follow_links_depth)
         self.max_linked_docs = max_linked_docs
-        self.store = CrawlStore(self.out_dir)
+        database_url = os.environ.get("PRG_DATABASE_URL") or os.environ.get("DATABASE_URL")
+        if database_url and os.environ.get("PRG_DISABLE_POSTGRES") not in {"1", "true", "yes"}:
+            self.store = PostgresCrawlStore(database_url)
+        else:
+            self.store = CrawlStore(self.out_dir)
         self.client = PRGClient(timeout=timeout, retries=retries)
 
     def close(self) -> None:
@@ -211,6 +217,7 @@ class Crawler:
                 pages=len(document.raw.get("pages") or []),
             )
             paths = export_document(document, self.out_dir, self.formats)
+            self.store.save_document_outputs(document, paths)
             self.store.upsert_document(
                 doc_id,
                 "exported",

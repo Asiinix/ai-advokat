@@ -3,7 +3,14 @@ name = "prg-parser"
 version = "0.1.0"
 description = "CLI parser for free PRG.ZANGER documents"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = [
+    "psycopg[binary]>=3.2",
+]
 
 [project.scripts]
 prg-parser = "prg_parser.cli:main"
+prg-parser-railway = "prg_parser.railway_worker:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

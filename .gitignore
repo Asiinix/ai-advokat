@@ -1,4 +1,6 @@
 data/
+output/
+tmp/
 __pycache__/
 *.pyc
 .DS_Store

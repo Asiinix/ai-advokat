@@ -126,6 +126,31 @@ data/
 python3 -m prg_parser --out /Users/asiin/Downloads/prg-data doc 35502996
 ```
 
+## Railway и Postgres
+
+Локально парсер по умолчанию пишет файлы в `data/` и состояние в `data/state.sqlite3`.
+
+Если в окружении есть `DATABASE_URL` или `PRG_DATABASE_URL`, парсер автоматически включает Postgres-хранилище:
+
+- статусы документов и страниц списка пишутся в Postgres;
+- `document.html`, `document.txt`, `document.json`, `document.pdf` и `meta.json` сохраняются в таблицу `document_outputs`;
+- найденные связи документов сохраняются в `document_links`;
+- локальный экспорт в `--out` остается как временная копия.
+
+Для Railway используется worker:
+
+```bash
+python -m prg_parser.railway_worker
+```
+
+Он держит контейнер живым. Чтобы запустить парсер на деплое, задай переменную `PRG_COMMAND`, например:
+
+```text
+--out /tmp/prg-data --formats html,txt,json doc 35502996
+```
+
+Для больших запусков лучше начинать с маленьких диапазонов и обязательно включать `json`, чтобы raw-слой попал в Postgres.
+
 ## Форматы
 
 Доступные форматы:
