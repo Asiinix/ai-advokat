@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .document import DocumentData
+from .listing import DocumentRef
 from .utils import now_iso
 
 
@@ -61,6 +62,20 @@ class PostgresCrawlStore:
             )
             cur.execute(
                 """
+                CREATE TABLE IF NOT EXISTS listing_documents (
+                    page INTEGER NOT NULL,
+                    doc_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    source_url TEXT NOT NULL DEFAULT '',
+                    search_id TEXT NOT NULL DEFAULT '',
+                    position INTEGER NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (page, doc_id)
+                )
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS document_outputs (
                     doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
                     format TEXT NOT NULL,
@@ -87,6 +102,7 @@ class PostgresCrawlStore:
                 )
                 """
             )
+            cur.execute("CREATE INDEX IF NOT EXISTS listing_documents_doc_id_idx ON listing_documents(doc_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS document_outputs_format_idx ON document_outputs(format)")
             cur.execute("CREATE INDEX IF NOT EXISTS document_links_linked_idx ON document_links(linked_doc_id)")
             self._conn.commit()
@@ -114,6 +130,51 @@ class PostgresCrawlStore:
                 (page, status, doc_count, total, error, now_iso()),
             )
             self._conn.commit()
+
+    def get_listing_page_status(self, page: int) -> str | None:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT status FROM listing_pages WHERE page = %s", (page,))
+            row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def save_listing_documents(self, page: int, refs: Iterable[DocumentRef]) -> None:
+        now = now_iso()
+        refs = list(refs)
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("DELETE FROM listing_documents WHERE page = %s", (page,))
+            cur.executemany(
+                """
+                INSERT INTO listing_documents(page, doc_id, title, source_url, search_id, position, updated_at)
+                VALUES(%s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    (page, ref.doc_id, ref.title, ref.source_url, ref.search_id, index, now)
+                    for index, ref in enumerate(refs)
+                ],
+            )
+            self._conn.commit()
+
+    def get_listing_documents(self, page: int) -> list[DocumentRef]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doc_id, title, source_url, search_id
+                FROM listing_documents
+                WHERE page = %s
+                ORDER BY position
+                """,
+                (page,),
+            )
+            rows = cur.fetchall()
+        return [
+            DocumentRef(
+                doc_id=str(doc_id),
+                title=str(title or ""),
+                source_url=str(source_url or ""),
+                search_id=str(search_id or ""),
+            )
+            for doc_id, title, source_url, search_id in rows
+        ]
 
     def upsert_document(
         self,
@@ -185,6 +246,20 @@ class PostgresCrawlStore:
             )
             existing = {str(row[0]) for row in cur.fetchall()}
         return all(fmt in existing for fmt in required)
+
+    def get_document_links(self, doc_id: str) -> list[str]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT linked_doc_id
+                FROM document_links
+                WHERE doc_id = %s
+                ORDER BY position
+                """,
+                (doc_id,),
+            )
+            rows = cur.fetchall()
+        return [str(row[0]) for row in rows]
 
     def save_document_outputs(self, document: DocumentData, paths: dict[str, Path]) -> None:
         now = now_iso()

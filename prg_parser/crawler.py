@@ -83,36 +83,54 @@ class Crawler:
         if from_page < 1 or to_page < from_page:
             raise ValueError("Page range must be valid: from_page >= 1 and to_page >= from_page.")
 
-        refs: list[DocumentRef] = []
         seen: set[str] = set()
+        queued_count = 0
         for page in range(from_page, to_page + 1):
-            print(f"[list] страница {page}/{to_page}")
+            page_refs: list[DocumentRef] = []
+            fetched_page = False
+            if not self.force and self.store.get_listing_page_status(page) == "done":
+                page_refs = self.store.get_listing_documents(page)
+                if page_refs:
+                    print(f"[list] страница {page}/{to_page}: уже есть, документов {len(page_refs)}")
+                else:
+                    print(f"[list] страница {page}/{to_page}: done без сохраненного списка, перечитываю")
+
             try:
-                listing = fetch_listing_page(self.client, page=page, list_url=list_url)
-                self.store.mark_listing_page(
-                    page,
-                    "done",
-                    doc_count=len(listing.documents),
-                    total=listing.total,
-                )
-                print(
-                    f"       найдено {len(listing.documents)} документов"
-                    + (f", всего {listing.total}" if listing.total else "")
-                )
-                for ref in listing.documents:
+                if not page_refs:
+                    print(f"[list] страница {page}/{to_page}")
+                    listing = fetch_listing_page(self.client, page=page, list_url=list_url)
+                    page_refs = listing.documents
+                    fetched_page = True
+                    self.store.save_listing_documents(page, page_refs)
+                    self.store.mark_listing_page(
+                        page,
+                        "done",
+                        doc_count=len(page_refs),
+                        total=listing.total,
+                    )
+                    print(
+                        f"       найдено {len(page_refs)} документов"
+                        + (f", всего {listing.total}" if listing.total else "")
+                    )
+                new_refs: list[DocumentRef] = []
+                for ref in page_refs:
                     if ref.doc_id not in seen:
                         seen.add(ref.doc_id)
-                        refs.append(ref)
-                        if max_docs and len(refs) >= max_docs:
+                        new_refs.append(ref)
+                        queued_count += 1
+                        if max_docs and queued_count >= max_docs:
                             break
-                if max_docs and len(refs) >= max_docs:
+                if new_refs:
+                    self.crawl_refs(new_refs)
+                else:
+                    print(f"[docs] страница {page}: новых документов нет")
+                if max_docs and queued_count >= max_docs:
                     break
             except Exception as exc:
                 self.store.mark_listing_page(page, "failed", error=str(exc))
                 print(f"[list] ошибка на странице {page}: {exc}")
-            time.sleep(self.delay)
-
-        self.crawl_refs(refs)
+            if fetched_page:
+                time.sleep(self.delay)
 
     def crawl_file(self, path: str | Path) -> None:
         refs = load_document_refs_from_file(path)
@@ -195,7 +213,7 @@ class Crawler:
             and self.store.has_document_outputs(doc_id, self.formats)
         ):
             print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
-            return read_exported_links(self.out_dir, doc_id)
+            return self.store.get_document_links(doc_id)
 
         self.store.upsert_document(
             doc_id,
