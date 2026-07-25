@@ -1,0 +1,9 @@
+[project]
+name = "prg-parser"
+version = "0.1.0"
+description = "CLI parser for free PRG.ZANGER documents"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+prg-parser = "prg_parser.cli:main"
