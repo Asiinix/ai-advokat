@@ -111,7 +111,10 @@ def print_status(out_dir: str) -> None:
                 print(f"  {status}: {count}")
         else:
             print("  пока пусто")
-        print(f"State: {Path(out_dir) / 'state.sqlite3'}")
+        if getattr(crawler.store, "storage_label", "SQLite") == "Postgres":
+            print("Storage: Postgres")
+        else:
+            print(f"State: {Path(out_dir) / 'state.sqlite3'}")
     finally:
         crawler.close()
 

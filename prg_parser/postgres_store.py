@@ -10,6 +10,8 @@ from .utils import now_iso
 
 
 class PostgresCrawlStore:
+    storage_label = "Postgres"
+
     def __init__(self, database_url: str) -> None:
         try:
             import psycopg
@@ -170,6 +172,19 @@ class PostgresCrawlStore:
             cur.execute("SELECT status, COUNT(*) FROM listing_pages GROUP BY status")
             rows = cur.fetchall()
         return {str(status): int(count) for status, count in rows}
+
+    def has_document_outputs(self, doc_id: str, formats: Iterable[str]) -> bool:
+        required = tuple(formats)
+        if not required:
+            return True
+        placeholders = ", ".join(["%s"] * len(required))
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT format FROM document_outputs WHERE doc_id = %s AND format IN ({placeholders})",
+                (doc_id, *required),
+            )
+            existing = {str(row[0]) for row in cur.fetchall()}
+        return all(fmt in existing for fmt in required)
 
     def save_document_outputs(self, document: DocumentData, paths: dict[str, Path]) -> None:
         now = now_iso()

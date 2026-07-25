@@ -192,7 +192,7 @@ class Crawler:
         if (
             not self.force
             and self.store.get_document_status(doc_id) == "exported"
-            and outputs_exist(self.out_dir, doc_id, self.formats)
+            and self.store.has_document_outputs(doc_id, self.formats)
         ):
             print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
             return read_exported_links(self.out_dir, doc_id)

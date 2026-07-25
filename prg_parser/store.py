@@ -9,6 +9,8 @@ from .utils import ensure_dir, now_iso
 
 
 class CrawlStore:
+    storage_label = "SQLite"
+
     def __init__(self, out_dir: str | Path) -> None:
         self.out_dir = ensure_dir(out_dir)
         self.path = self.out_dir / "state.sqlite3"
@@ -147,6 +149,16 @@ class CrawlStore:
                 "SELECT status, COUNT(*) AS count FROM listing_pages GROUP BY status"
             ).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def has_document_outputs(self, doc_id: str, formats: Iterable[str]) -> bool:
+        doc_dir = self.out_dir / "documents" / doc_id
+        mapping = {
+            "html": doc_dir / "document.html",
+            "txt": doc_dir / "document.txt",
+            "json": doc_dir / "document.json",
+            "pdf": doc_dir / "document.pdf",
+        }
+        return all(mapping[fmt].exists() for fmt in formats)
 
     def save_document_outputs(self, document: object, paths: dict[str, Path]) -> None:
         return None
