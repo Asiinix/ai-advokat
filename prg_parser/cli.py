@@ -133,6 +133,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Пауза между проверками пустой очереди.",
     )
+    enrich_parser = subparsers.add_parser(
+        "enrich-failed-titles",
+        help="Добрать title у failed-документов без скачивания полного текста.",
+    )
+    enrich_parser.add_argument(
+        "--limit",
+        type=non_negative_int,
+        default=0,
+        help="Сколько failed-документов проверить; 0 = без лимита.",
+    )
+    enrich_parser.add_argument(
+        "--lease-seconds",
+        type=positive_int,
+        default=86400,
+        help="Через сколько секунд повторять failed-title задачу, если прошлый запуск не добрал title.",
+    )
     subparsers.add_parser("menu", help="Открыть интерактивную cmd-панель.")
     return parser
 
@@ -240,6 +256,11 @@ def run_args(args: argparse.Namespace) -> None:
                 idle_seconds=args.idle_seconds,
                 lease_seconds=args.lease_seconds,
                 poll_interval=args.poll_interval,
+            )
+        elif args.command == "enrich-failed-titles":
+            crawler.enrich_failed_titles(
+                limit=args.limit or None,
+                lease_seconds=args.lease_seconds,
             )
         else:
             raise SystemExit(f"Unknown command: {args.command}")

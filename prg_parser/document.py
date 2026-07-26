@@ -22,6 +22,31 @@ class DocumentData:
     html: str
 
 
+@dataclass(frozen=True)
+class DocumentMetadata:
+    doc_id: str
+    title: str
+    is_free: bool | None
+    pages: int | None
+
+
+class DocumentNotFreeError(PermissionError):
+    def __init__(self, metadata: DocumentMetadata) -> None:
+        super().__init__(f"Document {metadata.doc_id} is not marked as free.")
+        self.metadata = metadata
+
+
+def document_metadata_from_response(doc_id: str, data: dict[str, Any]) -> DocumentMetadata:
+    raw_is_free = data.get("isDocumentFree")
+    pages = data.get("pages")
+    return DocumentMetadata(
+        doc_id=doc_id,
+        title=str(data.get("name") or ""),
+        is_free=None if raw_is_free is None else bool(raw_is_free),
+        pages=len(pages) if isinstance(pages, list) else None,
+    )
+
+
 def document_page_url(doc_id: str, page_index: int, product: str = "lawyer") -> str:
     query = urllib.parse.urlencode({"withHtmlTags": "true", "product": product})
     return f"{API_BASE_URL}/api/Document/GetDocument/{doc_id}/{page_index}?{query}"
@@ -129,10 +154,11 @@ class DocumentDownloader:
         progress: ProgressCallback | None = None,
     ) -> DocumentData:
         first = self._fetch_page(doc_id, 0)
-        is_free = bool(first.get("isDocumentFree"))
-        title = str(first.get("name") or f"document-{doc_id}")
+        metadata = document_metadata_from_response(doc_id, first)
+        is_free = bool(metadata.is_free)
+        title = metadata.title or f"document-{doc_id}"
         if self.only_free and not is_free:
-            raise PermissionError(f"Document {doc_id} is not marked as free.")
+            raise DocumentNotFreeError(metadata)
 
         pages = first.get("pages") or []
         if not pages:
@@ -175,6 +201,10 @@ class DocumentDownloader:
             linked_doc_ids=linked_doc_ids,
             html=body_html,
         )
+
+    def fetch_document_metadata(self, doc_id: str) -> DocumentMetadata:
+        first = self._fetch_page(doc_id, 0)
+        return document_metadata_from_response(doc_id, first)
 
     def _fetch_page(self, doc_id: str, page_index: int) -> dict[str, Any]:
         url = document_page_url(doc_id, page_index, self.product)

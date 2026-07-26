@@ -511,6 +511,85 @@ class CrawlStore:
             ).fetchall()
         return [str(row["doc_id"]) for row in rows]
 
+    def claim_failed_document_without_title(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> DocumentRef | None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat()
+        now = now_iso()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT doc_id, source_url
+                FROM documents
+                WHERE status = 'failed'
+                  AND COALESCE(title, '') = ''
+                  AND (
+                      locked_at IS NULL
+                      OR locked_by IS NULL
+                      OR locked_by NOT LIKE 'failed-title:%'
+                      OR locked_at < ?
+                  )
+                ORDER BY updated_at, doc_id
+                LIMIT 1
+                """,
+                (cutoff,),
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                """
+                UPDATE documents
+                SET locked_by=?,
+                    locked_at=?,
+                    updated_at=?
+                WHERE doc_id = ?
+                  AND status = 'failed'
+                  AND COALESCE(title, '') = ''
+                """,
+                (worker_id, now, now, row["doc_id"]),
+            )
+        return DocumentRef(doc_id=str(row["doc_id"]), source_url=str(row["source_url"] or ""))
+
+    def update_failed_document_title(
+        self,
+        doc_id: str,
+        title: str,
+        is_free: bool | None = None,
+        pages: int | None = None,
+    ) -> None:
+        now = now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE documents
+                SET title=COALESCE(NULLIF(?, ''), title),
+                    is_free=COALESCE(?, is_free),
+                    pages=COALESCE(?, pages),
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    updated_at=?
+                WHERE doc_id = ?
+                  AND status = 'failed'
+                """,
+                (title, None if is_free is None else int(is_free), pages, now, doc_id),
+            )
+
+    def defer_failed_title_enrichment(self, doc_id: str) -> None:
+        now = now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                UPDATE documents
+                SET locked_at=?,
+                    updated_at=?
+                WHERE doc_id = ?
+                  AND status = 'failed'
+                """,
+                (now, now, doc_id),
+            )
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             rows = self._conn.execute(

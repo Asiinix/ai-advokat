@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import DEFAULT_LIST_URL
-from .document import DocumentDownloader
+from .document import DocumentDownloader, DocumentNotFreeError
 from .exporters import export_document
 from .http_client import PRGClient
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
@@ -197,6 +197,76 @@ class Crawler:
         doc_ids = self.store.failed_documents()
         print(f"[retry] документов с ошибкой: {len(doc_ids)}")
         self.crawl_doc_ids(doc_ids)
+
+    def enrich_failed_titles(
+        self,
+        limit: int | None = None,
+        lease_seconds: int = 86400,
+    ) -> int:
+        if limit is not None and limit < 1:
+            limit = None
+
+        worker_prefix = f"failed-title:{socket.gethostname()}:{os.getpid()}"
+        state = {
+            "claimed": 0,
+            "enriched": 0,
+            "failed": 0,
+        }
+        state_lock = threading.Lock()
+
+        def worker_loop(worker_number: int) -> None:
+            worker_id = f"{worker_prefix}:{worker_number}"
+            downloader = DocumentDownloader(self.client, product=self.product, only_free=False)
+            while True:
+                with state_lock:
+                    if limit is not None and state["claimed"] >= limit:
+                        return
+                    ref = self.store.claim_failed_document_without_title(worker_id, lease_seconds)
+                    if ref is None:
+                        return
+                    state["claimed"] += 1
+                    index = int(state["claimed"])
+
+                print(f"[failed-title] {index}/{limit or 'failed'} {ref.doc_id}: читаю metadata")
+                try:
+                    metadata = downloader.fetch_document_metadata(ref.doc_id)
+                    title = metadata.title.strip()
+                    if not title:
+                        raise ValueError("PRG did not return document title.")
+                    self.store.update_failed_document_title(
+                        ref.doc_id,
+                        title=title,
+                        is_free=metadata.is_free,
+                        pages=metadata.pages,
+                    )
+                    with state_lock:
+                        state["enriched"] += 1
+                    print(f"[failed-title] {index}/{limit or 'failed'} {ref.doc_id}: title готов")
+                except Exception as exc:
+                    self.store.defer_failed_title_enrichment(ref.doc_id)
+                    with state_lock:
+                        state["failed"] += 1
+                    print(f"[failed-title] {index}/{limit or 'failed'} {ref.doc_id}: ошибка: {exc}")
+                finally:
+                    time.sleep(self.delay)
+
+        print(
+            f"[failed-title] старт: workers={self.workers}, "
+            f"limit={limit if limit is not None else 'нет'}, lease={lease_seconds}s"
+        )
+        if self.workers == 1:
+            worker_loop(1)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = [executor.submit(worker_loop, number) for number in range(1, self.workers + 1)]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+
+        print(
+            f"[failed-title] остановка: проверено {state['claimed']}, "
+            f"обогащено {state['enriched']}, ошибок {state['failed']}"
+        )
+        return int(state["enriched"])
 
     def enqueue_refs(self, refs: Iterable[DocumentRef], depth: int = 0) -> int:
         refs = list(refs)
@@ -481,6 +551,19 @@ class Crawler:
                 f"({outputs}, links:{link_count})"
             )
             return linked_doc_ids
+        except DocumentNotFreeError as exc:
+            metadata = exc.metadata
+            self.store.upsert_document(
+                doc_id,
+                "failed",
+                title=metadata.title or ref.title,
+                source_url=ref.source_url,
+                is_free=metadata.is_free,
+                pages=metadata.pages,
+                error=str(exc),
+            )
+            print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, title сохранен")
+            return []
         except Exception as exc:
             self.store.upsert_document(doc_id, "failed", title=ref.title, source_url=ref.source_url, error=str(exc))
             print(f"[docs] {index}/{total} {doc_id}: ошибка: {exc}")
