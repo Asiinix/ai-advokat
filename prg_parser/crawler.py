@@ -417,15 +417,20 @@ class Crawler:
         claimed: bool = False,
     ) -> list[str]:
         doc_id = ref.doc_id
+        status = None if self.force else self.store.get_document_status(doc_id)
+        if not self.force and self.store.has_document_outputs(doc_id, self.formats):
+            if status != "exported":
+                self.store.upsert_document(
+                    doc_id,
+                    "exported",
+                    title=ref.title,
+                    source_url=ref.source_url,
+                    formats=self.formats,
+                )
+            print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
+            return self.store.get_document_links(doc_id)
+
         if not claimed:
-            status = None if self.force else self.store.get_document_status(doc_id)
-            if (
-                not self.force
-                and status == "exported"
-                and self.store.has_document_outputs(doc_id, self.formats)
-            ):
-                print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
-                return self.store.get_document_links(doc_id)
             if not self.force and status == "failed" and self.store.is_terminal_document_failure(doc_id):
                 print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, пропускаю")
                 return []
