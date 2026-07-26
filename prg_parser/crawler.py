@@ -103,11 +103,20 @@ class Crawler:
         if from_page < 1 or to_page < from_page:
             raise ValueError("Page range must be valid: from_page >= 1 and to_page >= from_page.")
 
-        if not enqueue_only and not self.force and max_docs is None:
-            resume_page = self.store.recommended_range_start(from_page, to_page)
-            if resume_page > from_page:
-                print(f"[resume] продолжаю диапазон со страницы {resume_page}/{to_page}")
-                from_page = resume_page
+        if not self.force and max_docs is None:
+            if enqueue_only:
+                resume_page = self.store.recommended_enqueue_start(from_page, to_page)
+                if resume_page > to_page:
+                    print(f"[resume] все страницы {from_page}-{to_page} уже в очереди или обработаны")
+                    return
+                if resume_page > from_page:
+                    print(f"[resume] продолжаю постановку в очередь со страницы {resume_page}/{to_page}")
+                    from_page = resume_page
+            else:
+                resume_page = self.store.recommended_range_start(from_page, to_page)
+                if resume_page > from_page:
+                    print(f"[resume] продолжаю диапазон со страницы {resume_page}/{to_page}")
+                    from_page = resume_page
 
         seen: set[str] = set()
         queued_count = 0

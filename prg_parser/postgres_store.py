@@ -252,6 +252,23 @@ class PostgresCrawlStore:
                     return max(from_page, next_page)
         return from_page
 
+    def recommended_enqueue_start(self, from_page: int, to_page: int) -> int:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT page, docs_status
+                FROM listing_pages
+                WHERE page BETWEEN %s AND %s
+                """,
+                (from_page, to_page),
+            )
+            rows = cur.fetchall()
+        statuses = {int(page): status for page, status in rows}
+        for page in range(from_page, to_page + 1):
+            if statuses.get(page) not in {"queued", "done"}:
+                return page
+        return to_page + 1
+
     def save_listing_documents(self, page: int, refs: Iterable[DocumentRef]) -> None:
         now = now_iso()
         refs = list(refs)
