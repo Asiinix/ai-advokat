@@ -5,6 +5,8 @@ import gc
 import json
 import os
 import shutil
+import socket
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
@@ -96,11 +98,12 @@ class Crawler:
         to_page: int,
         list_url: str = DEFAULT_LIST_URL,
         max_docs: int | None = None,
+        enqueue_only: bool = False,
     ) -> None:
         if from_page < 1 or to_page < from_page:
             raise ValueError("Page range must be valid: from_page >= 1 and to_page >= from_page.")
 
-        if not self.force and max_docs is None:
+        if not enqueue_only and not self.force and max_docs is None:
             resume_page = self.store.recommended_range_start(from_page, to_page)
             if resume_page > from_page:
                 print(f"[resume] продолжаю диапазон со страницы {resume_page}/{to_page}")
@@ -109,6 +112,9 @@ class Crawler:
         seen: set[str] = set()
         queued_count = 0
         for page in range(from_page, to_page + 1):
+            if enqueue_only and not self.force and self.store.is_listing_documents_queued(page):
+                print(f"[list] страница {page}/{to_page}: документы уже в очереди, пропускаю")
+                continue
             if not self.force and self.store.is_listing_documents_done(page):
                 print(f"[list] страница {page}/{to_page}: документы уже обработаны, пропускаю")
                 continue
@@ -149,12 +155,18 @@ class Crawler:
                         if max_docs and queued_count >= max_docs:
                             page_limited = True
                             break
-                if new_refs:
+                if new_refs and enqueue_only:
+                    added = self.enqueue_refs(new_refs, depth=0)
+                    print(f"[queue] страница {page}: поставлено в очередь {added}/{len(new_refs)}")
+                elif new_refs:
                     self.store.mark_listing_documents_status(page, "processing")
                     self.crawl_refs(new_refs)
                 else:
                     print(f"[docs] страница {page}: новых документов нет")
-                self.store.mark_listing_documents_status(page, "partial" if page_limited else "done")
+                if enqueue_only:
+                    self.store.mark_listing_documents_status(page, "partial" if page_limited else "queued")
+                else:
+                    self.store.mark_listing_documents_status(page, "partial" if page_limited else "done")
                 if max_docs and queued_count >= max_docs:
                     break
             except Exception as exc:
@@ -176,6 +188,114 @@ class Crawler:
         doc_ids = self.store.failed_documents()
         print(f"[retry] документов с ошибкой: {len(doc_ids)}")
         self.crawl_doc_ids(doc_ids)
+
+    def enqueue_refs(self, refs: Iterable[DocumentRef], depth: int = 0) -> int:
+        refs = list(refs)
+        if not refs:
+            return 0
+        return self.store.enqueue_document_refs(
+            refs,
+            depth=depth,
+            force=self.force,
+            formats=self.formats,
+        )
+
+    def process_queue(
+        self,
+        limit: int | None = None,
+        idle_seconds: float = 0,
+        lease_seconds: int = 1800,
+        poll_interval: float = 5.0,
+    ) -> int:
+        if limit is not None and limit < 1:
+            limit = None
+        stale = self.store.requeue_stale_documents(lease_seconds)
+        if stale:
+            print(f"[queue] возвращено зависших processing -> queued: {stale}")
+
+        worker_prefix = f"{socket.gethostname()}:{os.getpid()}"
+        state = {
+            "claimed": 0,
+            "processed": 0,
+            "active": 0,
+            "last_work": time.monotonic(),
+            "stop": False,
+        }
+        state_lock = threading.Lock()
+
+        def should_stop() -> bool:
+            with state_lock:
+                if state["stop"]:
+                    return True
+                return bool(limit is not None and state["claimed"] >= limit)
+
+        def worker_loop(worker_number: int) -> None:
+            worker_id = f"{worker_prefix}:{worker_number}"
+            while not should_stop():
+                item = self.store.claim_queued_document(worker_id)
+                if item is None:
+                    stale_count = self.store.requeue_stale_documents(lease_seconds)
+                    if stale_count:
+                        print(f"[queue] {worker_number}: возвращено зависших задач: {stale_count}")
+                        continue
+                    with state_lock:
+                        idle_for = time.monotonic() - float(state["last_work"])
+                        active = int(state["active"])
+                        if active == 0 and (idle_seconds <= 0 or idle_for >= idle_seconds):
+                            state["stop"] = True
+                            return
+                    time.sleep(max(0.1, poll_interval))
+                    continue
+
+                ref, depth = item
+                with state_lock:
+                    if limit is not None and state["claimed"] >= limit:
+                        self.store.enqueue_document_refs([ref], depth=depth, force=True, formats=self.formats)
+                        state["stop"] = True
+                        return
+                    state["claimed"] += 1
+                    state["active"] += 1
+                    index = int(state["claimed"])
+                    state["last_work"] = time.monotonic()
+
+                try:
+                    linked_doc_ids = self._process_ref(
+                        ref,
+                        index=index,
+                        total=limit or "queue",
+                        depth=depth,
+                        claimed=True,
+                    )
+                    if self.follow_links_depth and depth < self.follow_links_depth and linked_doc_ids:
+                        refs_to_enqueue = [DocumentRef(doc_id=doc_id) for doc_id in linked_doc_ids]
+                        added = self.enqueue_refs(refs_to_enqueue, depth=depth + 1)
+                        if added:
+                            print(f"[links] {ref.doc_id}: поставлено в очередь связанных документов: {added}")
+                finally:
+                    with state_lock:
+                        state["processed"] += 1
+                        state["active"] -= 1
+                        state["last_work"] = time.monotonic()
+
+        print(
+            f"[queue] старт worker-режима: workers={self.workers}, "
+            f"limit={limit if limit is not None else 'нет'}, depth={self.follow_links_depth}"
+        )
+        if self.workers == 1:
+            worker_loop(1)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = [executor.submit(worker_loop, number) for number in range(1, self.workers + 1)]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+
+        stats = self.store.queue_stats()
+        print(
+            f"[queue] остановка: обработано {state['processed']}, "
+            f"queued={stats.get('queued', 0)}, processing={stats.get('processing', 0)}, "
+            f"exported={stats.get('exported', 0)}, failed={stats.get('failed', 0)}"
+        )
+        return int(state["processed"])
 
     def crawl_refs(self, refs: list[DocumentRef]) -> None:
         if not refs:
@@ -235,28 +355,36 @@ class Crawler:
         self,
         ref: DocumentRef,
         index: int,
-        total: int,
+        total: int | str,
         depth: int = 0,
+        claimed: bool = False,
     ) -> list[str]:
         doc_id = ref.doc_id
-        status = None if self.force else self.store.get_document_status(doc_id)
-        if (
-            not self.force
-            and status == "exported"
-            and self.store.has_document_outputs(doc_id, self.formats)
-        ):
-            print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
-            return self.store.get_document_links(doc_id)
-        if not self.force and status == "failed" and self.store.is_terminal_document_failure(doc_id):
-            print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, пропускаю")
-            return []
+        if not claimed:
+            status = None if self.force else self.store.get_document_status(doc_id)
+            if (
+                not self.force
+                and status == "exported"
+                and self.store.has_document_outputs(doc_id, self.formats)
+            ):
+                print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
+                return self.store.get_document_links(doc_id)
+            if not self.force and status == "failed" and self.store.is_terminal_document_failure(doc_id):
+                print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, пропускаю")
+                return []
 
-        self.store.upsert_document(
-            doc_id,
-            "queued",
-            title=ref.title,
-            source_url=ref.source_url,
-        )
+            self.store.upsert_document(
+                doc_id,
+                "queued",
+                title=ref.title,
+                source_url=ref.source_url,
+            )
+            self.store.upsert_document(
+                doc_id,
+                "processing",
+                title=ref.title,
+                source_url=ref.source_url,
+            )
         depth_label = f", depth={depth}" if self.follow_links_depth else ""
         print(f"[docs] {index}/{total} {doc_id}: загрузка{depth_label}")
         try:
@@ -264,7 +392,7 @@ class Crawler:
             document = downloader.fetch_document(doc_id)
             self.store.upsert_document(
                 doc_id,
-                "downloaded",
+                "processing",
                 title=document.title,
                 source_url=ref.source_url,
                 is_free=document.is_free,

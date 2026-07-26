@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .config import DEFAULT_FORMATS, DEFAULT_LIST_URL, SUPPORTED_FORMATS
 from .crawler import Crawler
-from .listing import fetch_listing_page
+from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
 from .http_client import PRGClient
 from .utils import parse_formats
 
@@ -19,6 +19,13 @@ def positive_int(value: str) -> int:
 
 def non_negative_int(value: str) -> int:
     number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("Value must be >= 0")
+    return number
+
+
+def non_negative_float(value: str) -> float:
+    number = float(value)
     if number < 0:
         raise argparse.ArgumentTypeError("Value must be >= 0")
     return number
@@ -42,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product", default="lawyer", help="Product для API PRG, по умолчанию lawyer.")
     parser.add_argument("--include-paid", action="store_true", help="Не пропускать документы без флага free.")
     parser.add_argument("--force", action="store_true", help="Перезаписать уже готовые документы.")
+    parser.add_argument(
+        "--enqueue-only",
+        action="store_true",
+        help="Только поставить документы в очередь, не скачивать их сразу.",
+    )
     parser.add_argument(
         "--follow-links-depth",
         type=non_negative_int,
@@ -74,6 +86,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("status", help="Показать статистику state.sqlite3.")
     subparsers.add_parser("retry", help="Повторить документы со статусом failed.")
+    work_parser = subparsers.add_parser("work", help="Обрабатывать очередь документов из базы.")
+    work_parser.add_argument("--limit", type=non_negative_int, default=0, help="Сколько документов обработать; 0 = без лимита.")
+    work_parser.add_argument(
+        "--idle-seconds",
+        type=non_negative_float,
+        default=0,
+        help="Сколько ждать новые задачи после опустошения очереди; 0 = выйти сразу.",
+    )
+    work_parser.add_argument(
+        "--lease-seconds",
+        type=positive_int,
+        default=1800,
+        help="Через сколько секунд возвращать зависшие processing обратно в queued.",
+    )
+    work_parser.add_argument(
+        "--poll-interval",
+        type=non_negative_float,
+        default=5.0,
+        help="Пауза между проверками пустой очереди.",
+    )
     subparsers.add_parser("menu", help="Открыть интерактивную cmd-панель.")
     return parser
 
@@ -147,13 +179,31 @@ def run_args(args: argparse.Namespace) -> None:
                 to_page=args.to_page,
                 list_url=args.list_url,
                 max_docs=args.max_docs,
+                enqueue_only=args.enqueue_only,
             )
         elif args.command == "file":
-            crawler.crawl_file(args.input)
+            if args.enqueue_only:
+                file_refs = load_document_refs_from_file(args.input)
+                count = crawler.enqueue_refs(file_refs)
+                print(f"[queue] из файла поставлено в очередь: {count}/{len(file_refs)}")
+            else:
+                crawler.crawl_file(args.input)
         elif args.command == "doc":
-            crawler.crawl_doc_ids(args.doc_ids)
+            if args.enqueue_only:
+                doc_refs = [DocumentRef(doc_id=str(doc_id)) for doc_id in args.doc_ids]
+                count = crawler.enqueue_refs(doc_refs)
+                print(f"[queue] doc_id поставлено в очередь: {count}/{len(args.doc_ids)}")
+            else:
+                crawler.crawl_doc_ids(args.doc_ids)
         elif args.command == "retry":
             crawler.retry_failed()
+        elif args.command == "work":
+            crawler.process_queue(
+                limit=args.limit or None,
+                idle_seconds=args.idle_seconds,
+                lease_seconds=args.lease_seconds,
+                poll_interval=args.poll_interval,
+            )
         else:
             raise SystemExit(f"Unknown command: {args.command}")
     finally:

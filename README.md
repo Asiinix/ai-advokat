@@ -151,6 +151,25 @@ python -m prg_parser.railway_worker
 
 Для больших запусков лучше начинать с маленьких диапазонов и обязательно включать `json`, чтобы raw-слой попал в Postgres.
 
+### Очередь документов
+
+Для больших объемов можно разделить обход страниц и скачивание документов.
+Сначала страницы списка только складывают документы в очередь:
+
+```text
+--out /tmp/prg-data --formats html,txt,json --follow-links-depth 1 --enqueue-only range --from-page 1 --to-page 14845
+```
+
+Потом один или несколько воркеров разбирают очередь:
+
+```text
+--out /tmp/prg-data --formats html,txt,json --follow-links-depth 1 --workers 3 --delay 0 work --idle-seconds 60
+```
+
+В Postgres документы идут по статусам `queued -> processing -> exported/failed`.
+Воркеры берут задачи атомарно через `FOR UPDATE SKIP LOCKED`, поэтому несколько Railway-реплик могут работать с одной очередью и не должны скачивать один и тот же `doc_id`.
+Если контейнер умер на статусе `processing`, следующий запуск вернет зависшие задачи обратно в `queued` после `--lease-seconds`.
+
 ## Форматы
 
 Доступные форматы:

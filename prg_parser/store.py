@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -57,6 +58,7 @@ class CrawlStore:
                 )
                 """
             )
+            self._ensure_document_queue_columns()
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS listing_documents (
@@ -74,6 +76,7 @@ class CrawlStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS listing_documents_doc_id_idx ON listing_documents(doc_id)"
             )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS documents_status_depth_idx ON documents(status, queue_depth)")
 
     def _ensure_listing_progress_columns(self) -> None:
         rows = self._conn.execute("PRAGMA table_info(listing_pages)").fetchall()
@@ -87,6 +90,19 @@ class CrawlStore:
         for name, column_type in columns.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE listing_pages ADD COLUMN {name} {column_type}")
+
+    def _ensure_document_queue_columns(self) -> None:
+        rows = self._conn.execute("PRAGMA table_info(documents)").fetchall()
+        existing = {str(row["name"]) for row in rows}
+        columns = {
+            "queue_depth": "INTEGER NOT NULL DEFAULT 0",
+            "locked_by": "TEXT",
+            "locked_at": "TEXT",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, column_type in columns.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE documents ADD COLUMN {name} {column_type}")
 
     def mark_listing_page(
         self,
@@ -173,6 +189,14 @@ class CrawlStore:
                 (page,),
             ).fetchone()
         return bool(row and row["docs_status"] == "done")
+
+    def is_listing_documents_queued(self, page: int) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT docs_status FROM listing_pages WHERE page = ?",
+                (page,),
+            ).fetchone()
+        return bool(row and row["docs_status"] in {"queued", "done"})
 
     def recommended_range_start(self, from_page: int, to_page: int) -> int:
         with self._lock:
@@ -281,6 +305,8 @@ class CrawlStore:
                     pages=COALESCE(excluded.pages, documents.pages),
                     formats=COALESCE(NULLIF(excluded.formats, ''), documents.formats),
                     error=excluded.error,
+                    locked_by=CASE WHEN excluded.status = 'processing' THEN documents.locked_by ELSE NULL END,
+                    locked_at=CASE WHEN excluded.status = 'processing' THEN documents.locked_at ELSE NULL END,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -296,6 +322,152 @@ class CrawlStore:
                     now,
                 ),
             )
+
+    def enqueue_document_refs(
+        self,
+        refs: Iterable[DocumentRef],
+        depth: int = 0,
+        force: bool = False,
+        formats: Iterable[str] = (),
+    ) -> int:
+        now = now_iso()
+        added = 0
+        required_formats = tuple(formats)
+        with self._lock, self._conn:
+            for ref in refs:
+                row = self._conn.execute(
+                    """
+                    SELECT status, is_free, error, queue_depth
+                    FROM documents
+                    WHERE doc_id = ?
+                    """,
+                    (ref.doc_id,),
+                ).fetchone()
+                if row:
+                    status = str(row["status"])
+                    error = str(row["error"] or "").lower()
+                    terminal_failed = row["is_free"] == 0 or "not marked as free" in error
+                    outputs_ready = False
+                    if status == "exported":
+                        doc_dir = self.out_dir / "documents" / ref.doc_id
+                        mapping = {
+                            "html": doc_dir / "document.html",
+                            "txt": doc_dir / "document.txt",
+                            "json": doc_dir / "document.json",
+                            "pdf": doc_dir / "document.pdf",
+                        }
+                        outputs_ready = all(mapping[fmt].exists() for fmt in required_formats)
+                    if not force and (outputs_ready or status == "processing" or (status == "failed" and terminal_failed)):
+                        self._conn.execute(
+                            """
+                            UPDATE documents
+                            SET title=COALESCE(NULLIF(?, ''), title),
+                                source_url=COALESCE(NULLIF(?, ''), source_url),
+                                queue_depth=MIN(queue_depth, ?),
+                                updated_at=?
+                            WHERE doc_id = ?
+                            """,
+                            (ref.title, ref.source_url, depth, now, ref.doc_id),
+                        )
+                        continue
+
+                    was_queued = status == "queued"
+                    self._conn.execute(
+                        """
+                        UPDATE documents
+                        SET title=COALESCE(NULLIF(?, ''), title),
+                            source_url=COALESCE(NULLIF(?, ''), source_url),
+                            status='queued',
+                            queue_depth=MIN(queue_depth, ?),
+                            error=NULL,
+                            locked_by=NULL,
+                            locked_at=NULL,
+                            updated_at=?
+                        WHERE doc_id = ?
+                        """,
+                        (ref.title, ref.source_url, depth, now, ref.doc_id),
+                    )
+                    if not was_queued:
+                        added += 1
+                    continue
+
+                self._conn.execute(
+                    """
+                    INSERT INTO documents(
+                        doc_id, title, source_url, status, is_free, pages, formats, error,
+                        created_at, updated_at, queue_depth, locked_by, locked_at, attempts
+                    )
+                    VALUES(?, ?, ?, 'queued', NULL, NULL, '', NULL, ?, ?, ?, NULL, NULL, 0)
+                    """,
+                    (ref.doc_id, ref.title, ref.source_url, now, now, depth),
+                )
+                added += 1
+        return added
+
+    def claim_queued_document(self, worker_id: str) -> tuple[DocumentRef, int] | None:
+        now = now_iso()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                """
+                SELECT doc_id, title, source_url, queue_depth
+                FROM documents
+                WHERE status = 'queued'
+                ORDER BY queue_depth, updated_at, doc_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            self._conn.execute(
+                """
+                UPDATE documents
+                SET status='processing',
+                    locked_by=?,
+                    locked_at=?,
+                    attempts=attempts + 1,
+                    updated_at=?
+                WHERE doc_id = ?
+                """,
+                (worker_id, now, now, row["doc_id"]),
+            )
+        return (
+            DocumentRef(
+                doc_id=str(row["doc_id"]),
+                title=str(row["title"] or ""),
+                source_url=str(row["source_url"] or ""),
+            ),
+            int(row["queue_depth"] or 0),
+        )
+
+    def requeue_stale_documents(self, lease_seconds: int) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)).replace(microsecond=0).isoformat()
+        now = now_iso()
+        with self._lock, self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE documents
+                SET status='queued',
+                    locked_by=NULL,
+                    locked_at=NULL,
+                    updated_at=?
+                WHERE status = 'processing'
+                  AND (locked_at IS NULL OR locked_at < ?)
+                """,
+                (now, cutoff),
+            )
+            return int(cursor.rowcount or 0)
+
+    def queue_stats(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM documents
+                WHERE status IN ('queued', 'processing', 'exported', 'failed')
+                GROUP BY status
+                """
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def get_document_status(self, doc_id: str) -> str | None:
         with self._lock:
