@@ -12,6 +12,7 @@ from .utils import now_iso
 
 class PostgresCrawlStore:
     storage_label = "Postgres"
+    stores_document_outputs = True
 
     def __init__(self, database_url: str) -> None:
         try:
@@ -44,6 +45,10 @@ class PostgresCrawlStore:
                 )
                 """
             )
+            cur.execute("ALTER TABLE listing_pages ADD COLUMN IF NOT EXISTS docs_status TEXT")
+            cur.execute("ALTER TABLE listing_pages ADD COLUMN IF NOT EXISTS docs_error TEXT")
+            cur.execute("ALTER TABLE listing_pages ADD COLUMN IF NOT EXISTS docs_started_at TIMESTAMPTZ")
+            cur.execute("ALTER TABLE listing_pages ADD COLUMN IF NOT EXISTS docs_finished_at TIMESTAMPTZ")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -137,6 +142,105 @@ class PostgresCrawlStore:
             row = cur.fetchone()
         return str(row[0]) if row else None
 
+    def mark_listing_documents_status(
+        self,
+        page: int,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        now = now_iso()
+        started_at = now if status == "processing" else None
+        finished_at = now if status in {"done", "partial", "failed"} else None
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO listing_pages(
+                    page, status, doc_count, total, error, updated_at,
+                    docs_status, docs_error, docs_started_at, docs_finished_at
+                )
+                VALUES(%s, 'listed', 0, NULL, NULL, %s, %s, %s, %s, %s)
+                ON CONFLICT(page) DO UPDATE SET
+                    docs_status=excluded.docs_status,
+                    docs_error=excluded.docs_error,
+                    docs_started_at=COALESCE(excluded.docs_started_at, listing_pages.docs_started_at),
+                    docs_finished_at=CASE
+                        WHEN excluded.docs_status = 'processing' THEN NULL
+                        ELSE COALESCE(excluded.docs_finished_at, listing_pages.docs_finished_at)
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (page, now, status, error, started_at, finished_at),
+            )
+            if status == "done":
+                cur.execute(
+                    """
+                    UPDATE listing_pages
+                    SET docs_status = 'done',
+                        docs_finished_at = COALESCE(docs_finished_at, %s),
+                        updated_at = %s
+                    WHERE page <= %s
+                      AND COALESCE(docs_status, '') = ''
+                      AND EXISTS (
+                          SELECT 1
+                          FROM listing_documents
+                          WHERE listing_documents.page = listing_pages.page
+                      )
+                    """,
+                    (finished_at, now, page),
+                )
+            self._conn.commit()
+
+    def is_listing_documents_done(self, page: int) -> bool:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT docs_status FROM listing_pages WHERE page = %s", (page,))
+            row = cur.fetchone()
+        return bool(row and row[0] == "done")
+
+    def recommended_range_start(self, from_page: int, to_page: int) -> int:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT MIN(page)
+                FROM listing_pages
+                WHERE page BETWEEN %s AND %s
+                  AND docs_status IN ('processing', 'partial', 'failed')
+                """,
+                (from_page, to_page),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+
+            cur.execute(
+                """
+                SELECT MAX(ld.page)
+                FROM listing_documents AS ld
+                LEFT JOIN listing_pages AS lp ON lp.page = ld.page
+                WHERE ld.page BETWEEN %s AND %s
+                  AND COALESCE(lp.docs_status, '') <> 'done'
+                """,
+                (from_page, to_page),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+
+            cur.execute(
+                """
+                SELECT MAX(page)
+                FROM listing_pages
+                WHERE page BETWEEN %s AND %s
+                  AND docs_status = 'done'
+                """,
+                (from_page, to_page),
+            )
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                next_page = int(row[0]) + 1
+                if next_page <= to_page:
+                    return max(from_page, next_page)
+        return from_page
+
     def save_listing_documents(self, page: int, refs: Iterable[DocumentRef]) -> None:
         now = now_iso()
         refs = list(refs)
@@ -215,6 +319,15 @@ class PostgresCrawlStore:
             cur.execute("SELECT status FROM documents WHERE doc_id = %s", (doc_id,))
             row = cur.fetchone()
         return str(row[0]) if row else None
+
+    def is_terminal_document_failure(self, doc_id: str) -> bool:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute("SELECT status, is_free, error FROM documents WHERE doc_id = %s", (doc_id,))
+            row = cur.fetchone()
+        if not row or row[0] != "failed":
+            return False
+        error = str(row[2] or "").lower()
+        return row[1] is False or "not marked as free" in error
 
     def failed_documents(self) -> list[str]:
         with self._lock, self._conn.cursor() as cur:

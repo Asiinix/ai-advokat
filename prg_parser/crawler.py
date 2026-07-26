@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import concurrent.futures
+import gc
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Iterable
@@ -39,6 +41,19 @@ def read_exported_links(out_dir: str | Path, doc_id: str) -> list[str]:
     return [str(item) for item in links if str(item).isdigit()]
 
 
+def cleanup_document_exports(out_dir: str | Path, doc_id: str) -> None:
+    doc_dir = Path(out_dir) / "documents" / doc_id
+    if doc_dir.exists():
+        shutil.rmtree(doc_dir)
+
+
+def positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 class Crawler:
     def __init__(
         self,
@@ -63,6 +78,8 @@ class Crawler:
         self.force = force
         self.follow_links_depth = max(0, follow_links_depth)
         self.max_linked_docs = max_linked_docs
+        self._docs_since_gc = 0
+        self._gc_interval = positive_env_int("PRG_GC_INTERVAL", 25)
         database_url = os.environ.get("PRG_DATABASE_URL") or os.environ.get("DATABASE_URL")
         if database_url and os.environ.get("PRG_DISABLE_POSTGRES") not in {"1", "true", "yes"}:
             self.store = PostgresCrawlStore(database_url)
@@ -83,11 +100,22 @@ class Crawler:
         if from_page < 1 or to_page < from_page:
             raise ValueError("Page range must be valid: from_page >= 1 and to_page >= from_page.")
 
+        if not self.force and max_docs is None:
+            resume_page = self.store.recommended_range_start(from_page, to_page)
+            if resume_page > from_page:
+                print(f"[resume] продолжаю диапазон со страницы {resume_page}/{to_page}")
+                from_page = resume_page
+
         seen: set[str] = set()
         queued_count = 0
         for page in range(from_page, to_page + 1):
+            if not self.force and self.store.is_listing_documents_done(page):
+                print(f"[list] страница {page}/{to_page}: документы уже обработаны, пропускаю")
+                continue
+
             page_refs: list[DocumentRef] = []
             fetched_page = False
+            page_limited = False
             if not self.force and self.store.get_listing_page_status(page) == "done":
                 page_refs = self.store.get_listing_documents(page)
                 if page_refs:
@@ -119,14 +147,18 @@ class Crawler:
                         new_refs.append(ref)
                         queued_count += 1
                         if max_docs and queued_count >= max_docs:
+                            page_limited = True
                             break
                 if new_refs:
+                    self.store.mark_listing_documents_status(page, "processing")
                     self.crawl_refs(new_refs)
                 else:
                     print(f"[docs] страница {page}: новых документов нет")
+                self.store.mark_listing_documents_status(page, "partial" if page_limited else "done")
                 if max_docs and queued_count >= max_docs:
                     break
             except Exception as exc:
+                self.store.mark_listing_documents_status(page, "failed", error=str(exc))
                 self.store.mark_listing_page(page, "failed", error=str(exc))
                 print(f"[list] ошибка на странице {page}: {exc}")
             if fetched_page:
@@ -167,6 +199,7 @@ class Crawler:
 
     def _crawl_refs_with_links(self, refs: list[DocumentRef]) -> None:
         queue: list[tuple[DocumentRef, int]] = [(ref, 0) for ref in refs]
+        queued_doc_ids = {ref.doc_id for ref in refs}
         seen: set[str] = set()
         position = 0
         linked_added_total = 0
@@ -189,11 +222,10 @@ class Crawler:
             for linked_doc_id in linked_doc_ids:
                 if self.max_linked_docs is not None and linked_added_total >= self.max_linked_docs:
                     break
-                if linked_doc_id in seen:
-                    continue
-                if any(item.doc_id == linked_doc_id for item, _ in queue[position:]):
+                if linked_doc_id in seen or linked_doc_id in queued_doc_ids:
                     continue
                 queue.append((DocumentRef(doc_id=linked_doc_id), depth + 1))
+                queued_doc_ids.add(linked_doc_id)
                 added += 1
                 linked_added_total += 1
             if added:
@@ -207,13 +239,17 @@ class Crawler:
         depth: int = 0,
     ) -> list[str]:
         doc_id = ref.doc_id
+        status = None if self.force else self.store.get_document_status(doc_id)
         if (
             not self.force
-            and self.store.get_document_status(doc_id) == "exported"
+            and status == "exported"
             and self.store.has_document_outputs(doc_id, self.formats)
         ):
             print(f"[docs] {index}/{total} {doc_id}: уже готово, пропускаю")
             return self.store.get_document_links(doc_id)
+        if not self.force and status == "failed" and self.store.is_terminal_document_failure(doc_id):
+            print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, пропускаю")
+            return []
 
         self.store.upsert_document(
             doc_id,
@@ -236,6 +272,8 @@ class Crawler:
             )
             paths = export_document(document, self.out_dir, self.formats)
             self.store.save_document_outputs(document, paths)
+            linked_doc_ids = list(document.linked_doc_ids)
+            link_count = len(linked_doc_ids)
             self.store.upsert_document(
                 doc_id,
                 "exported",
@@ -245,15 +283,29 @@ class Crawler:
                 pages=len(document.raw.get("pages") or []),
                 formats=self.formats,
             )
+            if getattr(self.store, "stores_document_outputs", False):
+                cleanup_document_exports(self.out_dir, doc_id)
             outputs = ", ".join(f"{key}:{path.name}" for key, path in paths.items() if key != "meta")
             print(
                 f"[docs] {index}/{total} {doc_id}: готово "
-                f"({outputs}, links:{len(document.linked_doc_ids)})"
+                f"({outputs}, links:{link_count})"
             )
-            return document.linked_doc_ids
+            return linked_doc_ids
         except Exception as exc:
             self.store.upsert_document(doc_id, "failed", title=ref.title, source_url=ref.source_url, error=str(exc))
             print(f"[docs] {index}/{total} {doc_id}: ошибка: {exc}")
             return []
         finally:
+            if getattr(self.store, "stores_document_outputs", False):
+                try:
+                    cleanup_document_exports(self.out_dir, doc_id)
+                except OSError as cleanup_error:
+                    print(f"[docs] {index}/{total} {doc_id}: не удалось очистить временные файлы: {cleanup_error}")
+            self._maybe_collect_garbage()
             time.sleep(self.delay)
+
+    def _maybe_collect_garbage(self) -> None:
+        self._docs_since_gc += 1
+        if self._docs_since_gc >= self._gc_interval:
+            self._docs_since_gc = 0
+            gc.collect()
