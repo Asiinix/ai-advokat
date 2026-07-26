@@ -74,6 +74,33 @@ def build_parser() -> argparse.ArgumentParser:
     range_parser.add_argument("--list-url", default=DEFAULT_LIST_URL, help="URL списка с нужными фильтрами.")
     range_parser.add_argument("--max-docs", type=positive_int, help="Ограничить число документов.")
 
+    pipeline_parser = subparsers.add_parser(
+        "pipeline",
+        help="В одном процессе складывать страницы в очередь и параллельно скачивать документы.",
+    )
+    pipeline_parser.add_argument("--from-page", type=positive_int, required=True)
+    pipeline_parser.add_argument("--to-page", type=positive_int, required=True)
+    pipeline_parser.add_argument("--list-url", default=DEFAULT_LIST_URL, help="URL списка с нужными фильтрами.")
+    pipeline_parser.add_argument("--max-docs", type=positive_int, help="Ограничить число документов со страниц.")
+    pipeline_parser.add_argument(
+        "--idle-seconds",
+        type=non_negative_float,
+        default=60,
+        help="Сколько ждать пустую очередь после завершения обхода страниц.",
+    )
+    pipeline_parser.add_argument(
+        "--lease-seconds",
+        type=positive_int,
+        default=1800,
+        help="Через сколько секунд возвращать зависшие processing обратно в queued.",
+    )
+    pipeline_parser.add_argument(
+        "--poll-interval",
+        type=non_negative_float,
+        default=5.0,
+        help="Пауза между проверками пустой очереди.",
+    )
+
     file_parser = subparsers.add_parser("file", help="Скачать документы из файла с doc_id или URL.")
     file_parser.add_argument("--input", required=True, help="Файл: один doc_id или URL на строку.")
 
@@ -180,6 +207,16 @@ def run_args(args: argparse.Namespace) -> None:
                 list_url=args.list_url,
                 max_docs=args.max_docs,
                 enqueue_only=args.enqueue_only,
+            )
+        elif args.command == "pipeline":
+            crawler.crawl_range_pipeline(
+                from_page=args.from_page,
+                to_page=args.to_page,
+                list_url=args.list_url,
+                max_docs=args.max_docs,
+                idle_seconds=args.idle_seconds,
+                lease_seconds=args.lease_seconds,
+                poll_interval=args.poll_interval,
             )
         elif args.command == "file":
             if args.enqueue_only:

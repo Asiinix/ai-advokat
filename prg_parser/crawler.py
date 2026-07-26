@@ -206,6 +206,7 @@ class Crawler:
         idle_seconds: float = 0,
         lease_seconds: int = 1800,
         poll_interval: float = 5.0,
+        producer_done: threading.Event | None = None,
     ) -> int:
         if limit is not None and limit < 1:
             limit = None
@@ -241,7 +242,8 @@ class Crawler:
                     with state_lock:
                         idle_for = time.monotonic() - float(state["last_work"])
                         active = int(state["active"])
-                        if active == 0 and (idle_seconds <= 0 or idle_for >= idle_seconds):
+                        producer_finished = producer_done is None or producer_done.is_set()
+                        if active == 0 and producer_finished and (idle_seconds <= 0 or idle_for >= idle_seconds):
                             state["stop"] = True
                             return
                     time.sleep(max(0.1, poll_interval))
@@ -296,6 +298,52 @@ class Crawler:
             f"exported={stats.get('exported', 0)}, failed={stats.get('failed', 0)}"
         )
         return int(state["processed"])
+
+    def crawl_range_pipeline(
+        self,
+        from_page: int,
+        to_page: int,
+        list_url: str = DEFAULT_LIST_URL,
+        max_docs: int | None = None,
+        idle_seconds: float = 60,
+        lease_seconds: int = 1800,
+        poll_interval: float = 5.0,
+    ) -> int:
+        producer_done = threading.Event()
+        producer_error: list[BaseException] = []
+
+        def producer() -> None:
+            try:
+                self.crawl_range(
+                    from_page=from_page,
+                    to_page=to_page,
+                    list_url=list_url,
+                    max_docs=max_docs,
+                    enqueue_only=True,
+                )
+            except BaseException as exc:
+                producer_error.append(exc)
+                raise
+            finally:
+                producer_done.set()
+
+        print(
+            f"[pipeline] старт: pages={from_page}-{to_page}, "
+            f"workers={self.workers}, depth={self.follow_links_depth}"
+        )
+        producer_thread = threading.Thread(target=producer, name="prg-listing-producer", daemon=True)
+        producer_thread.start()
+        processed = self.process_queue(
+            idle_seconds=idle_seconds,
+            lease_seconds=lease_seconds,
+            poll_interval=poll_interval,
+            producer_done=producer_done,
+        )
+        producer_thread.join()
+        if producer_error:
+            raise producer_error[0]
+        print(f"[pipeline] готово: обработано документов {processed}")
+        return processed
 
     def crawl_refs(self, refs: list[DocumentRef]) -> None:
         if not refs:
