@@ -33,7 +33,6 @@ jobs:
           node-version: 22
 
       - name: Deploy to Railway
-        working-directory: services/knowledge
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: >-
