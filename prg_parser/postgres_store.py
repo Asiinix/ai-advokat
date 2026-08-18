@@ -113,6 +113,55 @@ class PostgresCrawlStore:
             )
             cur.execute("CREATE INDEX IF NOT EXISTS listing_documents_doc_id_idx ON listing_documents(doc_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS documents_status_depth_idx ON documents(status, queue_depth)")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_updated_doc_idx
+                ON documents(updated_at DESC, doc_id DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_status_updated_doc_idx
+                ON documents(status, updated_at DESC, doc_id DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_title_sort_idx
+                ON documents((COALESCE(title, '')), doc_id DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_doc_id_length_idx
+                ON documents((length(doc_id)), doc_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_doc_id_pattern_idx
+                ON documents(doc_id text_pattern_ops)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_title_search_idx
+                ON documents USING GIN (
+                    to_tsvector('simple', COALESCE(title, ''))
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS documents_formats_gin_idx
+                ON documents USING GIN (
+                    (COALESCE(
+                        string_to_array(NULLIF(formats, ''), ','),
+                        ARRAY[]::text[]
+                    ))
+                )
+                """
+            )
             cur.execute("CREATE INDEX IF NOT EXISTS document_outputs_format_idx ON document_outputs(format)")
             cur.execute("CREATE INDEX IF NOT EXISTS document_links_linked_idx ON document_links(linked_doc_id)")
             self._conn.commit()
