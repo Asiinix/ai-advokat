@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import DEFAULT_LIST_URL
-from .http_client import PRGClient
+from .http_client import SourceClient
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,7 @@ def parse_listing_html(raw_html: str, page: int, url: str) -> ListingPage:
 
 
 def fetch_listing_page(
-    client: PRGClient,
+    client: SourceClient,
     page: int,
     list_url: str = DEFAULT_LIST_URL,
 ) -> ListingPage:

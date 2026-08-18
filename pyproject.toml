@@ -1,16 +1,19 @@
 [project]
-name = "prg-parser"
+name = "ai-advokat-parser"
 version = "0.1.0"
-description = "CLI parser for free PRG.ZANGER documents"
+description = "AI Advokat ingestion CLI for legal documents sourced from PRG.ZANGER"
 requires-python = ">=3.9"
 dependencies = [
     "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
-prg-parser = "prg_parser.cli:main"
-prg-parser-railway = "prg_parser.railway_worker:main"
+ai-advokat = "ai_advokat_parser.cli:main"
+ai-advokat-railway = "ai_advokat_parser.railway_worker:main"
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ai_advokat_parser"]

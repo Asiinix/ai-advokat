@@ -19,9 +19,9 @@ database = KnowledgeDatabase(settings.database_url)
 search = ElasticsearchStore(settings.elasticsearch_url, settings.elasticsearch_index)
 
 mcp = FastMCP(
-    "PRG Legal Knowledge",
+    "AI Advokat Legal Knowledge",
     instructions=(
-        "Search and read the PRG.ZANGER legal document collection. "
+        "Search and read the AI Advokat legal collection sourced from PRG.ZANGER. "
         "Use search_documents first, then get_document for exact source text. "
         "Always cite doc_id and title in answers."
     ),
@@ -46,7 +46,7 @@ def search_documents(query: str, limit: int = 5) -> dict[str, Any]:
 
 @mcp.tool()
 def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[str, Any]:
-    """Read an exact slice of a PRG document by doc_id, with pagination for long documents."""
+    """Read an exact slice of a legal document by doc_id, with pagination for long documents."""
     document = database.load_document(doc_id.strip())
     if document is None:
         return {"found": False, "doc_id": doc_id}
@@ -70,7 +70,7 @@ def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[s
 
 @mcp.tool()
 def get_related_documents(doc_id: str, limit: int = 20) -> dict[str, Any]:
-    """Return documents referenced by the selected PRG document."""
+    """Return documents referenced by the selected legal document."""
     safe_limit = max(1, min(limit, 100))
     related = database.related_documents(doc_id.strip(), safe_limit)
     return {"doc_id": doc_id, "related": related, "count": len(related)}

@@ -2,6 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python -m prg_parser.railway_worker"
+startCommand = "python -m ai_advokat_parser.railway_worker"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3

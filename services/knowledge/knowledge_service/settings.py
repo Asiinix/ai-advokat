@@ -63,7 +63,7 @@ class Settings:
         return cls(
             database_url=_required("DATABASE_URL"),
             elasticsearch_url=_required("ELASTICSEARCH_URL").rstrip("/"),
-            elasticsearch_index=os.environ.get("ELASTICSEARCH_INDEX", "prg_chunks_v1").strip(),
+            elasticsearch_index=os.environ.get("ELASTICSEARCH_INDEX", "ai_advokat_chunks_v1").strip(),
             mode=mode,
             port=_int_env("PORT", 8000, minimum=1),
             mcp_api_key=os.environ.get("MCP_API_KEY", "").strip(),

@@ -113,7 +113,7 @@ def build_document_html(document: DocumentData) -> str:
 
 
 def find_chrome_binary() -> str | None:
-    env_path = os.environ.get("PRG_CHROME")
+    env_path = os.environ.get("AI_ADVOCAT_CHROME")
     if env_path and Path(env_path).exists():
         return env_path
 
@@ -142,7 +142,7 @@ def export_pdf(html_path: Path, pdf_path: Path) -> None:
     if not chrome:
         raise RuntimeError(
             "PDF export needs Google Chrome/Chromium. "
-            "Install it or set PRG_CHROME=/path/to/chrome."
+            "Install it or set AI_ADVOCAT_CHROME=/path/to/chrome."
         )
     command = [
         chrome,

@@ -14,7 +14,7 @@ from typing import Iterable
 from .config import DEFAULT_LIST_URL
 from .document import DocumentDownloader, DocumentNotFreeError
 from .exporters import export_document
-from .http_client import PRGClient
+from .http_client import SourceClient
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
 from .postgres_store import PostgresCrawlStore
 from .store import CrawlStore
@@ -81,13 +81,13 @@ class Crawler:
         self.follow_links_depth = max(0, follow_links_depth)
         self.max_linked_docs = max_linked_docs
         self._docs_since_gc = 0
-        self._gc_interval = positive_env_int("PRG_GC_INTERVAL", 25)
-        database_url = os.environ.get("PRG_DATABASE_URL") or os.environ.get("DATABASE_URL")
-        if database_url and os.environ.get("PRG_DISABLE_POSTGRES") not in {"1", "true", "yes"}:
+        self._gc_interval = positive_env_int("AI_ADVOCAT_GC_INTERVAL", 25)
+        database_url = os.environ.get("AI_ADVOCAT_DATABASE_URL") or os.environ.get("DATABASE_URL")
+        if database_url and os.environ.get("AI_ADVOCAT_DISABLE_POSTGRES") not in {"1", "true", "yes"}:
             self.store = PostgresCrawlStore(database_url)
         else:
             self.store = CrawlStore(self.out_dir)
-        self.client = PRGClient(timeout=timeout, retries=retries)
+        self.client = SourceClient(timeout=timeout, retries=retries)
 
     def close(self) -> None:
         self.store.close()
@@ -232,7 +232,7 @@ class Crawler:
                     metadata = downloader.fetch_document_metadata(ref.doc_id)
                     title = metadata.title.strip()
                     if not title:
-                        raise ValueError("PRG did not return document title.")
+                        raise ValueError("The source did not return a document title.")
                     self.store.update_failed_document_title(
                         ref.doc_id,
                         title=title,
@@ -410,7 +410,7 @@ class Crawler:
             f"[pipeline] старт: pages={from_page}-{to_page}, "
             f"workers={self.workers}, depth={self.follow_links_depth}"
         )
-        producer_thread = threading.Thread(target=producer, name="prg-listing-producer", daemon=True)
+        producer_thread = threading.Thread(target=producer, name="ai-advokat-listing-producer", daemon=True)
         producer_thread.start()
         processed = self.process_queue(
             idle_seconds=idle_seconds,

@@ -11,7 +11,7 @@ from typing import Any
 from .config import DEFAULT_HEADERS
 
 
-class PRGRequestError(RuntimeError):
+class SourceRequestError(RuntimeError):
     def __init__(self, url: str, message: str, status: int | None = None):
         super().__init__(message)
         self.url = url
@@ -25,7 +25,7 @@ class ResponseText:
     text: str
 
 
-class PRGClient:
+class SourceClient:
     def __init__(
         self,
         timeout: float = 30.0,
@@ -61,15 +61,15 @@ class PRGClient:
                 if exc.code in {429, 500, 502, 503, 504} and attempt < self.retries:
                     time.sleep(self.retry_delay * attempt)
                     continue
-                raise PRGRequestError(url, body or str(exc), status=exc.code) from exc
+                raise SourceRequestError(url, body or str(exc), status=exc.code) from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 last_error = exc
                 if attempt < self.retries:
                     time.sleep(self.retry_delay * attempt)
                     continue
-                raise PRGRequestError(url, str(exc)) from exc
+                raise SourceRequestError(url, str(exc)) from exc
 
-        raise PRGRequestError(url, str(last_error or "Unknown request error"))
+        raise SourceRequestError(url, str(last_error or "Unknown request error"))
 
     def get_json(self, url: str, query: dict[str, Any] | None = None) -> Any:
         response = self.get_text(url, query=query)
@@ -77,4 +77,4 @@ class PRGClient:
             return json.loads(response.text)
         except json.JSONDecodeError as exc:
             preview = response.text[:500].replace("\n", " ")
-            raise PRGRequestError(response.url, f"Invalid JSON response: {preview}") from exc
+            raise SourceRequestError(response.url, f"Invalid JSON response: {preview}") from exc

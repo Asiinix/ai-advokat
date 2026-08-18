@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .config import API_BASE_URL, BASE_URL
-from .http_client import PRGClient
+from .http_client import SourceClient
 
 ProgressCallback = Callable[[str], None]
 
@@ -140,7 +140,7 @@ def extract_linked_doc_ids(fragment: str, current_doc_id: str) -> list[str]:
 class DocumentDownloader:
     def __init__(
         self,
-        client: PRGClient,
+        client: SourceClient,
         product: str = "lawyer",
         only_free: bool = True,
     ) -> None:

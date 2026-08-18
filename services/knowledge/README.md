@@ -1,23 +1,23 @@
-# PRG Knowledge Service
+# AI Advokat Knowledge Service
 
-Изолированный поисковый слой поверх данных `prg-parser`:
+Изолированный поисковый слой поверх данных `ai-advokat-parser`:
 
 - Postgres хранит очередь индексации и исходные документы;
 - индексатор режет `txt` на фрагменты и пишет их в Elasticsearch;
 - MCP отдаёт поиск, документ, связанные документы и состояние коллекции.
 
 ```text
-prg-parser -> Postgres documents/document_outputs
+ai-advokat-parser -> Postgres documents/document_outputs
                   |
                   v
           search_index_jobs
           queued -> processing -> indexed/failed
                   |
                   v
-         prg-indexer -> Elasticsearch prg_chunks_v1
+  ai-advokat-indexer -> Elasticsearch ai_advokat_chunks_v1
                               |
                               v
-                         prg-mcp /mcp
+                 ai-advokat-mcp /mcp
 ```
 
 Индексатор создаёт задания только для документов со статусом `exported` и
@@ -50,7 +50,7 @@ Authorization: Bearer <key>
 
 ```text
 Transport: Streamable HTTP
-URL: https://prg-mcp-production.up.railway.app/mcp
+URL: https://ai-advokat-mcp-production.up.railway.app/mcp
 Header: Authorization: Bearer <MCP_API_KEY>
 ```
 

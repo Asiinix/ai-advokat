@@ -6,7 +6,7 @@ from pathlib import Path
 from .config import DEFAULT_FORMATS, DEFAULT_LIST_URL, SUPPORTED_FORMATS
 from .crawler import Crawler
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
-from .http_client import PRGClient
+from .http_client import SourceClient
 from .utils import parse_formats
 
 
@@ -33,8 +33,8 @@ def non_negative_float(value: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="prg-parser",
-        description="Парсер бесплатных документов PRG.ZANGER.",
+        prog="ai-advokat",
+        description="Парсер AI Advokat для юридических документов.",
     )
     parser.add_argument("--out", default="data", help="Папка для результатов и state.sqlite3.")
     parser.add_argument(
@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=positive_int, default=1, help="Параллельные загрузчики документов.")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout, секунд.")
     parser.add_argument("--retries", type=positive_int, default=3, help="Количество повторов запроса.")
-    parser.add_argument("--product", default="lawyer", help="Product для API PRG, по умолчанию lawyer.")
+    parser.add_argument("--product", default="lawyer", help="Product API источника, по умолчанию lawyer.")
     parser.add_argument("--include-paid", action="store_true", help="Не пропускать документы без флага free.")
     parser.add_argument("--force", action="store_true", help="Перезаписать уже готовые документы.")
     parser.add_argument(
@@ -204,7 +204,7 @@ def run_args(args: argparse.Namespace) -> None:
         return
 
     if args.command == "list":
-        listing = fetch_listing_page(PRGClient(timeout=args.timeout, retries=args.retries), args.page, args.list_url)
+        listing = fetch_listing_page(SourceClient(timeout=args.timeout, retries=args.retries), args.page, args.list_url)
         print(f"URL: {listing.url}")
         print(f"Документов на странице: {len(listing.documents)}")
         if listing.total:
@@ -339,7 +339,7 @@ def run_menu(default_out: str = "data") -> None:
     list_url = DEFAULT_LIST_URL
 
     while True:
-        print("\nPRG Parser CMD")
+        print("\nAI Advokat Parser")
         print("================")
         print(f"Папка: {out_dir}")
         print(f"Форматы: {', '.join(formats)}")
@@ -391,7 +391,7 @@ def run_menu(default_out: str = "data") -> None:
                     crawler.close()
             elif choice == "4":
                 page = ask_int("Страница списка", 1)
-                listing = fetch_listing_page(PRGClient(), page=page, list_url=list_url)
+                listing = fetch_listing_page(SourceClient(), page=page, list_url=list_url)
                 print(f"Найдено: {len(listing.documents)}")
                 if listing.total:
                     print(f"Всего: {listing.total}, страниц: {listing.total_pages}")

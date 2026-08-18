@@ -1,2 +1,1 @@
-"""PRG search indexing and MCP access service."""
-
+"""AI Advokat search indexing and MCP access service."""

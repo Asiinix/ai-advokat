@@ -1,7 +1,7 @@
 [project]
-name = "prg-knowledge-service"
+name = "ai-advokat-knowledge-service"
 version = "0.1.0"
-description = "Elasticsearch indexer and MCP server for the PRG legal document collection"
+description = "Elasticsearch indexer and MCP server for the AI Advokat legal document collection"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27,<1",

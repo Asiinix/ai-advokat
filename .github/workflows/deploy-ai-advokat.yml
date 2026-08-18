@@ -1,16 +1,19 @@
-name: Deploy knowledge services
+name: Deploy AI Advokat services
 
 on:
   push:
     branches:
       - main
     paths:
+      - "ai_advokat_parser/**"
       - "services/knowledge/**"
-      - ".github/workflows/deploy-knowledge.yml"
+      - "pyproject.toml"
+      - "railway.toml"
+      - ".github/workflows/deploy-ai-advokat.yml"
   workflow_dispatch:
 
 concurrency:
-  group: deploy-knowledge-production
+  group: deploy-ai-advokat-production
   cancel-in-progress: false
 
 jobs:
@@ -21,8 +24,9 @@ jobs:
       fail-fast: false
       matrix:
         service:
-          - prg-indexer
-          - prg-mcp
+          - ai-advokat-parser
+          - ai-advokat-indexer
+          - ai-advokat-mcp
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
