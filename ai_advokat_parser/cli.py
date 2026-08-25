@@ -215,6 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_int,
         help="Прочитать одну страницу поиска для проверки снятого контракта.",
     )
+    sot_probe_parser.add_argument(
+        "--inspect-first-decision",
+        action="store_true",
+        help="После --page прочитать первую карточку и вывести только схему полей, без значений.",
+    )
 
     sot_scan_parser = subparsers.add_parser(
         "sot-scan",
@@ -463,7 +468,12 @@ def run_sot_command(args: argparse.Namespace) -> None:
         sot_runtime.print_status(args.out, getattr(args, "scan_id", None))
         return
     if args.command == "sot-probe-auth":
-        code = sot_runtime.probe_auth(timeout=args.timeout, retries=args.retries, page=args.page)
+        code = sot_runtime.probe_auth(
+            timeout=args.timeout,
+            retries=args.retries,
+            page=args.page,
+            inspect_first_decision=args.inspect_first_decision,
+        )
         if code:
             raise SystemExit(code)
         return

@@ -35,6 +35,13 @@ class SotSearchPage:
     item_keys: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SotPayloadSchema:
+    root_keys: tuple[str, ...]
+    nested_keys: tuple[tuple[str, tuple[str, ...]], ...]
+    text_candidates: tuple[tuple[str, int], ...]
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -138,6 +145,41 @@ class SotSource:
             text=text,
             raw=payload if isinstance(payload, Mapping) else {"payload": payload},
             metadata=metadata,
+        )
+
+    def inspect_decision_schema(self, ref: SotDecisionRef) -> SotPayloadSchema:
+        """Read one decision and return only structural hints, never values."""
+        url, method, body = self.config.decision_request(ref.decision_id)
+        payload, _response = self.client.request_json(url, method=method, json_body=body)
+        root_keys = tuple(sorted(str(key) for key in payload)) if isinstance(payload, Mapping) else ()
+        nested: list[tuple[str, tuple[str, ...]]] = []
+        text_candidates: list[tuple[str, int]] = []
+
+        def walk(value: Any, path: str, depth: int) -> None:
+            if isinstance(value, str):
+                if len(value.strip()) >= 80:
+                    text_candidates.append((path, len(value)))
+                return
+            if depth >= 3:
+                return
+            if isinstance(value, Mapping):
+                if path:
+                    nested.append((path, tuple(sorted(str(key) for key in value))))
+                for key, child in value.items():
+                    walk(child, f"{path}.{key}" if path else str(key), depth + 1)
+                return
+            if isinstance(value, (list, tuple)) and value:
+                first = value[0]
+                list_path = f"{path}[]"
+                if isinstance(first, Mapping):
+                    nested.append((list_path, tuple(sorted(str(key) for key in first))))
+                walk(first, f"{path}.0", depth + 1)
+
+        walk(payload, "", 0)
+        return SotPayloadSchema(
+            root_keys=root_keys,
+            nested_keys=tuple(nested[:30]),
+            text_candidates=tuple(text_candidates[:30]),
         )
 
     def extract_metadata(self, item: Any) -> dict[str, Any]:

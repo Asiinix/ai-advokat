@@ -152,6 +152,7 @@ def probe_auth(
     page: int | None = None,
     env: Mapping[str, str] | None = None,
     login_url: str | None = None,
+    inspect_first_decision: bool = False,
 ) -> int:
     """Verify the PRG.SOT login and, if asked, read exactly one search page.
 
@@ -214,6 +215,23 @@ def probe_auth(
     for ref in result.refs[:3]:
         fields = ", ".join(f"{key}={value}" for key, value in sorted(ref.metadata.items()) if key != "parties")
         print(f"[sot]   {ref.decision_key} {fields}")
+    if inspect_first_decision:
+        if not result.refs:
+            print("[sot] схема первой карточки пропущена: страница пуста")
+            return 0
+        try:
+            schema = source.inspect_decision_schema(result.refs[0])
+        except SourceRateLimitError as exc:
+            print(f"[sot] лимит при проверке карточки: {exc.rate_limit.describe()}")
+            return 3
+        print(f"[sot] поля решения: {', '.join(schema.root_keys) or '-'}")
+        for path, keys in schema.nested_keys:
+            print(f"[sot] вложенная схема {path}: {', '.join(keys) or '-'}")
+        if schema.text_candidates:
+            for path, length in schema.text_candidates:
+                print(f"[sot] кандидат текста {path}: {length} символов")
+        else:
+            print("[sot] кандидаты длинного текста: не найдены")
     return 0
 
 

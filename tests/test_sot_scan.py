@@ -848,6 +848,39 @@ class SotCliTest(SotScanBase):
         self.assertEqual(self.server.state.search_hits, [1])
         self.assertEqual(self.server.state.decision_hits, [])
 
+    def test_probe_can_inspect_the_first_decision_without_printing_values(self) -> None:
+        decision_ids = self.load(count=2, page_size=2)
+        overrides = self.server.config_overrides()
+        env = clean_env(
+            **{
+                SOT_USERNAME_ENV: self.server.state.username,
+                SOT_PASSWORD_ENV: self.server.state.password,
+                "AI_ADVOCAT_SOT_BASE_URL": overrides["base_url"],
+                "AI_ADVOCAT_SOT_SEARCH_URL_TEMPLATE": overrides["search_url_template"],
+                "AI_ADVOCAT_SOT_DECISION_URL_TEMPLATE": overrides["decision_url_template"],
+                "AI_ADVOCAT_SOT_RESULTS_PATH": overrides["results_path"],
+                "AI_ADVOCAT_SOT_TOTAL_PATH": overrides["total_path"],
+                "AI_ADVOCAT_SOT_ID_PATH": overrides["id_path"],
+                "AI_ADVOCAT_SOT_TEXT_PATH": overrides["text_path"],
+            }
+        )
+        with mock.patch.dict(os.environ, env, clear=True):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = cli.sot_runtime.probe_auth(
+                    timeout=5,
+                    page=1,
+                    login_url=self.server.login_url,
+                    inspect_first_decision=True,
+                )
+
+        rendered = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("поля решения: decision", rendered)
+        self.assertIn("вложенная схема decision", rendered)
+        self.assertIn("кандидат текста decision.body", rendered)
+        self.assertNotIn("Текст судебного акта", rendered)
+        self.assertEqual(self.server.state.decision_hits, [decision_ids[0]])
+
     def test_probe_auth_without_credentials_is_a_clear_failure(self) -> None:
         with mock.patch.dict(os.environ, clean_env(), clear=True):
             with contextlib.redirect_stdout(io.StringIO()) as out:
