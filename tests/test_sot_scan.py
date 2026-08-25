@@ -840,6 +840,8 @@ class SotCliTest(SotScanBase):
         self.assertIn("/assets/sot-app.js?v=1", rendered)
         self.assertNotIn("cdn.invalid", rendered)
         self.assertIn("элементов 2", rendered)
+        self.assertIn("поля ответа: data", rendered)
+        self.assertIn("поля карточки: caseNumber", rendered)
         self.assertIn("prg_sot:", rendered)
         self.assertNotIn(self.server.state.password, rendered)
         self.assertNotIn("SOTSESSION", rendered)

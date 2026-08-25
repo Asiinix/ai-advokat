@@ -208,6 +208,8 @@ def probe_auth(
         f"total {result.total if result.total is not None else '-'}, "
         f"cursor {'есть' if result.next_cursor else 'нет'}"
     )
+    print(f"[sot] поля ответа: {', '.join(result.payload_keys) or '-'}")
+    print(f"[sot] поля карточки: {', '.join(result.item_keys) or '-'}")
     print(f"[sot] квота: {client.last_rate_limit.describe()}")
     for ref in result.refs[:3]:
         fields = ", ".join(f"{key}={value}" for key, value in sorted(ref.metadata.items()) if key != "parties")

@@ -31,6 +31,8 @@ class SotSearchPage:
     total: int | None
     next_cursor: str | None
     raw_count: int
+    payload_keys: tuple[str, ...]
+    item_keys: tuple[str, ...]
 
 
 def sha256_text(value: str) -> str:
@@ -104,7 +106,18 @@ class SotSource:
         if self.config.next_cursor_path:
             raw_cursor = dotted_get(payload, self.config.next_cursor_path)
             next_cursor = str(raw_cursor) if raw_cursor not in (None, "") else None
-        return SotSearchPage(page=page, refs=refs, total=total, next_cursor=next_cursor, raw_count=len(items))
+        payload_keys = tuple(sorted(str(key) for key in payload)) if isinstance(payload, Mapping) else ()
+        first_item = items[0] if items else None
+        item_keys = tuple(sorted(str(key) for key in first_item)) if isinstance(first_item, Mapping) else ()
+        return SotSearchPage(
+            page=page,
+            refs=refs,
+            total=total,
+            next_cursor=next_cursor,
+            raw_count=len(items),
+            payload_keys=payload_keys,
+            item_keys=item_keys,
+        )
 
     def fetch_decision(self, ref: SotDecisionRef) -> SotDecisionPayload:
         url, method, body = self.config.decision_request(ref.decision_id)
