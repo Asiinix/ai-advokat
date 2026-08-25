@@ -285,20 +285,24 @@ python3 -m ai_advokat_parser --out /tmp/ai-advokat-data catalog-stubs --scan-id 
 
 ### Конфигурация источника
 
-Репозиторий не знает настоящих маршрутов PRG.SOT (они за платным входом) и ничего не выдумывает. Оператор снимает два запроса из живой подписанной сессии (DevTools → Network → Copy as cURL) и заполняет переменные окружения:
+Контракт PRG.SOT подтвержден живым read-only probe 26 августа 2026 года. Он остается в Variables, а не зашивается в код: если поставщик изменит маршрут или форму ответа, валидация остановит скан до первой записи вместо тихой потери документов.
 
 ```text
 AI_ADVOCAT_SOT_USERNAME=...
 AI_ADVOCAT_SOT_PASSWORD=...
 AI_ADVOCAT_SOT_BASE_URL=https://sb.prg.kz
-AI_ADVOCAT_SOT_SEARCH_URL_TEMPLATE=...   # обязателен один из {page}/{offset}/{cursor}
-AI_ADVOCAT_SOT_DECISION_URL_TEMPLATE=... # обязателен {decision_id}
-AI_ADVOCAT_SOT_RESULTS_PATH=data.items
-AI_ADVOCAT_SOT_ID_PATH=id
-AI_ADVOCAT_SOT_TEXT_PATH=decision.body
+AI_ADVOCAT_SOT_SEARCH_URL_TEMPLATE=https://sb.prg.kz/api/Lawsuit/get-lawsuits
+AI_ADVOCAT_SOT_SEARCH_METHOD=POST
+AI_ADVOCAT_SOT_DECISION_URL_TEMPLATE=https://sb.prg.kz/api/Lawsuit/find-lawsuit?Id={decision_id}
+AI_ADVOCAT_SOT_RESULTS_PATH=list
+AI_ADVOCAT_SOT_TOTAL_PATH=total
+AI_ADVOCAT_SOT_ID_PATH=ordinalId
+AI_ADVOCAT_SOT_TEXT_PATH=documents.*.htmlText
 ```
 
-Опционально: `AI_ADVOCAT_SOT_TOTAL_PATH`, `AI_ADVOCAT_SOT_NEXT_CURSOR_PATH`, `AI_ADVOCAT_SOT_PAGE_SIZE`, `AI_ADVOCAT_SOT_QUERY`, `AI_ADVOCAT_SOT_DECISION_PAGE_URL_TEMPLATE` и `AI_ADVOCAT_SOT_FIELD_MAP` — JSON вида `поле -> путь` для полей `case_number`, `court`, `judge`, `region`, `instance`, `proceeding_type`, `decision_date`, `title`, `parties`. Шаблоны обязаны указывать на `AI_ADVOCAT_SOT_BASE_URL` — иначе сессионный cookie ушел бы чужому origin. Пока контракт не заполнен полностью, `sot-scan` падает до первой записи скана; `sot-status` и проверка только логина остаются доступны.
+`AI_ADVOCAT_SOT_SEARCH_BODY_TEMPLATE` содержит подтвержденный JSON фильтра и пагинацию `{page}`/`{page_size}`. `AI_ADVOCAT_SOT_FIELD_MAP` — JSON вида `поле -> путь` для `case_number`, `court`, `judge`, `region`, `instance`, `proceeding_type`, `decision_date`, `title`, `parties`; для объединения истца и ответчика поддерживается путь `plaintiff|defendant`.
+
+В проверенном ответе `total=6 443 276` — число судебных дел, а `totalDoc=16 454 818` — число вложенных документов. Скан страниц идет по делам (`total`), затем забирает все `documents[].htmlText`, очищает HTML, объединяет тексты для поиска и сохраняет исходный JSON со всеми документами. Поэтому второй и последующие документы дела не теряются. Шаблоны обязаны указывать на `AI_ADVOCAT_SOT_BASE_URL` — иначе сессионный cookie ушел бы чужому origin. Пока контракт не заполнен полностью, `sot-scan` падает до первой записи скана; `sot-status` и проверка только логина остаются доступны.
 
 ### Живая проверка перед сканом (гейт валидации)
 

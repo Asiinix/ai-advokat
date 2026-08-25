@@ -13,10 +13,11 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ..config import AuthProfile, sot_auth_profile
+from ..exporters import html_to_text
 from ..http_client import SourceClient
 from . import decision_key as make_decision_key
 from .model import SotDecisionPayload, SotDecisionRef, SotDecisionUnavailableError, SotDiscoveryError
-from .source_config import METADATA_FIELDS, SotSourceConfig, dotted_get
+from .source_config import METADATA_FIELDS, SotSourceConfig, dotted_get, dotted_values
 
 # The scan is a background bulk reader on a shared subscription, so it stays far
 # below anything a human session would produce.
@@ -129,8 +130,15 @@ class SotSource:
     def fetch_decision(self, ref: SotDecisionRef) -> SotDecisionPayload:
         url, method, body = self.config.decision_request(ref.decision_id)
         payload, _response = self.client.request_json(url, method=method, json_body=body)
-        raw_text = dotted_get(payload, self.config.text_path)
-        text = "" if raw_text is None else str(raw_text).strip()
+        raw_values = dotted_values(payload, self.config.text_path)
+        text_parts = []
+        for raw_text in raw_values:
+            if isinstance(raw_text, (Mapping, list, tuple)):
+                continue
+            cleaned = html_to_text(str(raw_text)).strip()
+            if cleaned:
+                text_parts.append(cleaned)
+        text = "\n\n---\n\n".join(text_parts)
         if not text:
             raise SotDecisionUnavailableError(
                 ref.decision_id,
@@ -138,6 +146,7 @@ class SotSource:
             )
         metadata = dict(ref.metadata)
         metadata.update({key: value for key, value in self.extract_metadata(payload).items() if value})
+        metadata["document_count"] = len(text_parts)
         return SotDecisionPayload(
             decision_id=ref.decision_id,
             decision_key=ref.decision_key,
@@ -188,6 +197,12 @@ class SotSource:
         for name in METADATA_FIELDS:
             path = self.config.field_map.get(name)
             if not path:
+                continue
+            if name == "parties" and "|" in path:
+                values = [dotted_get(item, candidate.strip()) for candidate in path.split("|")]
+                parties = [value for value in values if value not in (None, "")]
+                if parties:
+                    found[name] = parties
                 continue
             value = dotted_get(item, path)
             if value in (None, ""):

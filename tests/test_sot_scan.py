@@ -46,7 +46,7 @@ from ai_advokat_parser.sot.model import (
 )
 from ai_advokat_parser.sot.postgres_store import SotPostgresStore
 from ai_advokat_parser.sot.scan import SotScanner
-from ai_advokat_parser.sot.source_config import SotConfigError, SotSourceConfig
+from ai_advokat_parser.sot.source_config import SotConfigError, SotSourceConfig, dotted_values
 from ai_advokat_parser.sot.store import SotStore
 
 from .support_sot import FakeSotServer, make_decision_payload
@@ -179,6 +179,11 @@ class SotSourceConfigTest(unittest.TestCase):
         config = self.base()
         self.assertIs(config.validate(), config)
         self.assertTrue(config.is_configured)
+
+    def test_dotted_values_expands_every_document(self) -> None:
+        payload = {"documents": [{"htmlText": "one"}, {"htmlText": "two"}]}
+        self.assertEqual(dotted_values(payload, "documents.*.htmlText"), ["one", "two"])
+        self.assertEqual(dotted_values(payload, "documents[].htmlText"), ["one", "two"])
 
     def test_search_template_without_pagination_is_rejected(self) -> None:
         with self.assertRaises(SotConfigError) as ctx:
@@ -325,6 +330,36 @@ class SotPaginationTest(SotScanBase):
         self.assertTrue(row["text_sha256"])
         self.assertTrue(row["raw_sha256"])
         self.assertGreater(int(row["text_chars"]), 0)
+
+    def test_one_case_keeps_all_nested_judicial_documents(self) -> None:
+        decision_id = self.load(count=1, page_size=1)[0]
+        self.server.state.decisions[decision_id] = {
+            "number": "2-1/2026",
+            "plaintiff": "ТОО Альфа",
+            "defendant": "ТОО Бета",
+            "documents": [
+                {"htmlText": "<p>Первый судебный документ.</p>"},
+                {"htmlText": "<p>Второй судебный документ.</p>"},
+            ],
+        }
+        source = self.make_source(
+            text_path="documents.*.htmlText",
+            field_map=json.dumps(
+                {"case_number": "number", "parties": "plaintiff|defendant"}
+            ),
+        )
+        ref = SotDecisionRef(
+            decision_id=decision_id,
+            decision_key=decision_key(decision_id),
+        )
+
+        payload = source.fetch_decision(ref)
+
+        self.assertIn("Первый судебный документ.", payload.text)
+        self.assertIn("Второй судебный документ.", payload.text)
+        self.assertNotIn("<p>", payload.text)
+        self.assertEqual(payload.metadata["document_count"], 2)
+        self.assertEqual(payload.metadata["parties"], ["ТОО Альфа", "ТОО Бета"])
 
 
 class SotResumeTest(SotScanBase):

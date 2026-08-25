@@ -97,6 +97,38 @@ def dotted_get(payload: Any, path: str, default: Any = None) -> Any:
     return default if current is None else current
 
 
+def dotted_values(payload: Any, path: str) -> list[Any]:
+    """Read every value from a dotted path with ``*``/``[]`` list expansion."""
+    if not path:
+        return []
+    normalized = path.replace("[]", ".*")
+    current = [payload]
+    for part in normalized.split("."):
+        if not part:
+            continue
+        following: list[Any] = []
+        for value in current:
+            if part == "*":
+                if isinstance(value, (list, tuple)):
+                    following.extend(value)
+                continue
+            if isinstance(value, Mapping):
+                if part in value:
+                    following.append(value[part])
+                continue
+            if isinstance(value, (list, tuple)):
+                try:
+                    index = int(part)
+                except ValueError:
+                    continue
+                if 0 <= index < len(value):
+                    following.append(value[index])
+        current = following
+        if not current:
+            break
+    return [value for value in current if value is not None]
+
+
 def _template_placeholders(template: str) -> set[str]:
     return set(PLACEHOLDER_RE.findall(template or ""))
 
