@@ -6,7 +6,10 @@ apart from the ZANGER crawler so neither pipeline can reach the other's state.
 
 from __future__ import annotations
 
+import html
 import os
+import re
+import urllib.parse
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,6 +20,29 @@ from .model import SotDiscoveryError
 from .source_config import SotConfigError, SotSourceConfig
 from .postgres_store import SotPostgresStore
 from .store import DECISION_FORMATS, SotStore
+
+SCRIPT_SRC_RE = re.compile(r"<script\b[^>]*\bsrc\s*=\s*['\"](?P<src>[^'\"]+)['\"]", re.I)
+
+
+def frontend_asset_paths(client, base_url: str) -> list[str]:
+    """Same-origin script paths from the already returned login landing page."""
+    landing = client.authenticated_landing
+    if landing is None:
+        return []
+    allowed = urllib.parse.urlparse(base_url)
+    found: list[str] = []
+    for match in SCRIPT_SRC_RE.finditer(landing.text):
+        absolute = urllib.parse.urljoin(landing.url, html.unescape(match.group("src")))
+        parsed = urllib.parse.urlparse(absolute)
+        if (parsed.scheme.lower(), parsed.netloc.lower()) != (
+            allowed.scheme.lower(),
+            allowed.netloc.lower(),
+        ):
+            continue
+        path = urllib.parse.urlunparse(("", "", parsed.path, parsed.params, parsed.query, ""))
+        if path and path not in found:
+            found.append(path)
+    return found
 
 
 def open_store(out_dir: str | Path, env: Mapping[str, str] | None = None):
@@ -150,6 +176,13 @@ def probe_auth(
         print(f"[sot] вход отклонен: {exc}")
         return 2
     print(f"[sot] вход выполнен, returnApp={client.auth.return_app}, returnUrl={client.auth.return_url}")
+    assets = frontend_asset_paths(client, config.base_url)
+    if assets:
+        print("[sot] frontend assets (same-origin):")
+        for asset in assets[:20]:
+            print(f"[sot]   {asset}")
+    else:
+        print("[sot] frontend assets: на стартовой странице не найдены")
 
     if page is None:
         print("[sot] проверка страницы поиска пропущена (передайте --page, когда контракт снят)")
@@ -190,6 +223,7 @@ __all__ = [
     "DECISION_FORMATS",
     "build_source",
     "credentials_state",
+    "frontend_asset_paths",
     "load_config",
     "open_store",
     "print_status",

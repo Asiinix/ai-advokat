@@ -335,6 +335,7 @@ class SourceClient:
         self._login_failure: tuple[str, int | None] | None = None
         self._login_failed_at = 0.0
         self._last_rate_limit = RateLimitInfo()
+        self._authenticated_landing: ResponseText | None = None
 
     @property
     def auth(self) -> AuthProfile:
@@ -352,6 +353,15 @@ class SourceClient:
     def last_rate_limit(self) -> RateLimitInfo:
         """Quota headers of the most recent response, for pacing decisions."""
         return self._last_rate_limit
+
+    @property
+    def authenticated_landing(self) -> ResponseText | None:
+        """Final application page returned by the most recent successful login.
+
+        This lets a source adapter inspect safe structural hints such as script
+        paths without repeating a request or exposing cookies/login payloads.
+        """
+        return self._authenticated_landing
 
     def authenticate(self) -> bool:
         """Validate configured credentials before starting a batch of work."""
@@ -523,6 +533,7 @@ class SourceClient:
         raise SourceAuthError(self.auth.login_url, message, status=status)
 
     def _perform_login(self, credentials: Credentials) -> None:
+        self._authenticated_landing = None
         for attempt in range(1, self.retries + 1):
             try:
                 self._perform_login_once(credentials)
@@ -580,6 +591,7 @@ class SourceClient:
                 f"PRG login did not establish a session cookie for {profile.return_url}.",
                 status=response.status,
             )
+        self._authenticated_landing = response
 
     def _login_request(self, request: urllib.request.Request, stage: str) -> ResponseText:
         """Run a login step, never surfacing the request body or the response body."""

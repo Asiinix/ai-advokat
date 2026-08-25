@@ -837,6 +837,8 @@ class SotCliTest(SotScanBase):
         rendered = out.getvalue()
         self.assertEqual(code, 0)
         self.assertIn("SUDBASEV2", rendered)
+        self.assertIn("/assets/sot-app.js?v=1", rendered)
+        self.assertNotIn("cdn.invalid", rendered)
         self.assertIn("элементов 2", rendered)
         self.assertIn("prg_sot:", rendered)
         self.assertNotIn(self.server.state.password, rendered)

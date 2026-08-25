@@ -15,7 +15,12 @@ import urllib.parse
 
 from .support_http import LOGIN_PAGE
 
-SOT_WELCOME_PAGE = "<!DOCTYPE html><html><body><p>sb.prg.kz</p></body></html>"
+SOT_WELCOME_PAGE = (
+    "<!DOCTYPE html><html><body><p>sb.prg.kz</p>"
+    "<script src='/assets/sot-app.js?v=1'></script>"
+    "<script src='https://cdn.invalid/foreign.js'></script>"
+    "</body></html>"
+)
 
 
 def make_decision_payload(decision_id: str, text: str | None = None) -> dict:
