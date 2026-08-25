@@ -6,7 +6,7 @@ from pathlib import Path
 from .config import DEFAULT_FORMATS, DEFAULT_LIST_URL, SUPPORTED_FORMATS
 from .crawler import Crawler
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
-from .http_client import SourceClient
+from .http_client import SourceAuthError, SourceClient
 from .utils import parse_formats
 
 
@@ -216,6 +216,9 @@ def run_args(args: argparse.Namespace) -> None:
 
     crawler = make_crawler(args)
     try:
+        local_enqueue_only = args.command in {"file", "doc"} and args.enqueue_only
+        if not local_enqueue_only and crawler.client.authenticate():
+            print("[auth] PRG: вход выполнен")
         if args.command == "range":
             crawler.crawl_range(
                 from_page=args.from_page,
@@ -316,7 +319,7 @@ def make_menu_crawler(
     follow_links_depth: int,
     max_linked_docs: int | None,
 ) -> Crawler:
-    return Crawler(
+    crawler = Crawler(
         out_dir=out_dir,
         formats=formats,
         delay=delay,
@@ -326,6 +329,13 @@ def make_menu_crawler(
         follow_links_depth=follow_links_depth,
         max_linked_docs=max_linked_docs,
     )
+    try:
+        if crawler.client.authenticate():
+            print("[auth] PRG: вход выполнен")
+        return crawler
+    except Exception:
+        crawler.close()
+        raise
 
 
 def run_menu(default_out: str = "data") -> None:
@@ -442,5 +452,5 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         run_args(args)
-    except ValueError as exc:
+    except (SourceAuthError, ValueError) as exc:
         parser.error(str(exc))

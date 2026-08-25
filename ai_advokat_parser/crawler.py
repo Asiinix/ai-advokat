@@ -14,7 +14,7 @@ from typing import Iterable
 from .config import DEFAULT_LIST_URL
 from .document import DocumentDownloader, DocumentNotFreeError
 from .exporters import export_document
-from .http_client import SourceClient
+from .http_client import SourceAuthError, SourceClient
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
 from .postgres_store import PostgresCrawlStore
 from .store import CrawlStore
@@ -88,6 +88,8 @@ class Crawler:
         else:
             self.store = CrawlStore(self.out_dir)
         self.client = SourceClient(timeout=timeout, retries=retries)
+        if self.client.uses_authentication:
+            print("[auth] PRG: учетные данные настроены через переменные окружения")
 
     def close(self) -> None:
         self.store.close()
@@ -178,6 +180,8 @@ class Crawler:
                     self.store.mark_listing_documents_status(page, "partial" if page_limited else "done")
                 if max_docs and queued_count >= max_docs:
                     break
+            except SourceAuthError:
+                raise
             except Exception as exc:
                 self.store.mark_listing_documents_status(page, "failed", error=str(exc))
                 self.store.mark_listing_page(page, "failed", error=str(exc))
@@ -211,6 +215,7 @@ class Crawler:
             "claimed": 0,
             "enriched": 0,
             "failed": 0,
+            "stop": False,
         }
         state_lock = threading.Lock()
 
@@ -219,7 +224,7 @@ class Crawler:
             downloader = DocumentDownloader(self.client, product=self.product, only_free=False)
             while True:
                 with state_lock:
-                    if limit is not None and state["claimed"] >= limit:
+                    if state["stop"] or (limit is not None and state["claimed"] >= limit):
                         return
                     ref = self.store.claim_failed_document_without_title(worker_id, lease_seconds)
                     if ref is None:
@@ -242,6 +247,11 @@ class Crawler:
                     with state_lock:
                         state["enriched"] += 1
                     print(f"[failed-title] {index}/{limit or 'failed'} {ref.doc_id}: title готов")
+                except SourceAuthError:
+                    self.store.defer_failed_title_enrichment(ref.doc_id)
+                    with state_lock:
+                        state["stop"] = True
+                    raise
                 except Exception as exc:
                     self.store.defer_failed_title_enrichment(ref.doc_id)
                     with state_lock:
@@ -352,6 +362,10 @@ class Crawler:
                         added = self.enqueue_refs(refs_to_enqueue, depth=depth + 1)
                         if added:
                             print(f"[links] {ref.doc_id}: поставлено в очередь связанных документов: {added}")
+                except SourceAuthError:
+                    with state_lock:
+                        state["stop"] = True
+                    raise
                 finally:
                     with state_lock:
                         state["processed"] += 1
@@ -442,7 +456,12 @@ class Crawler:
                 for index, ref in enumerate(refs, start=1)
             }
             for future in concurrent.futures.as_completed(futures):
-                future.result()
+                try:
+                    future.result()
+                except SourceAuthError:
+                    for pending in futures:
+                        pending.cancel()
+                    raise
 
     def _crawl_refs_with_links(self, refs: list[DocumentRef]) -> None:
         queue: list[tuple[DocumentRef, int]] = [(ref, 0) for ref in refs]
@@ -564,6 +583,23 @@ class Crawler:
             )
             print(f"[docs] {index}/{total} {doc_id}: платный/недоступный, title сохранен")
             return []
+        except SourceAuthError:
+            if claimed:
+                self.store.enqueue_document_refs(
+                    [ref],
+                    depth=depth,
+                    force=True,
+                    formats=self.formats,
+                )
+            else:
+                self.store.upsert_document(
+                    doc_id,
+                    "failed",
+                    title=ref.title,
+                    source_url=ref.source_url,
+                    error="PRG authentication interrupted the batch; retry after fixing credentials.",
+                )
+            raise
         except Exception as exc:
             self.store.upsert_document(doc_id, "failed", title=ref.title, source_url=ref.source_url, error=str(exc))
             print(f"[docs] {index}/{total} {doc_id}: ошибка: {exc}")

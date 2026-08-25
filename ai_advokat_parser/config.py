@@ -20,6 +20,13 @@ DEFAULT_LIST_URL = (
     "&documentStatus=1"
 )
 
+AUTH_HOST = "auth.zakon.kz"
+AUTH_LOGIN_URL = f"https://{AUTH_HOST}/account/login"
+AUTH_RETURN_URL = f"{BASE_URL}/"
+AUTH_RETURN_APP = "prgWeb"
+AUTH_USERNAME_ENV = "AI_ADVOCAT_PRG_USERNAME"
+AUTH_PASSWORD_ENV = "AI_ADVOCAT_PRG_PASSWORD"
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
