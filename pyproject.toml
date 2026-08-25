@@ -16,4 +16,4 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["ai_advokat_parser"]
+packages = ["ai_advokat_parser", "ai_advokat_parser.sot"]

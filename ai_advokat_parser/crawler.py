@@ -11,8 +11,20 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-from .config import DEFAULT_LIST_URL
-from .document import DocumentDownloader, DocumentNotFreeError
+from .catalog import (
+    OUTCOME_DONE,
+    PHASE_ABORTED,
+    PHASE_COMPLETED,
+    PHASE_DRAINING,
+    PHASE_ENUMERATING,
+    PHASE_PAUSED,
+    CatalogDiscoveryError,
+    CatalogScanState,
+    classify_document_failure,
+    sanitize_detail,
+)
+from .config import DEFAULT_ALL_DOCUMENTS_LIST_URL, DEFAULT_LIST_URL
+from .document import DocumentDownloader, DocumentNotFreeError, DocumentUnavailableError
 from .exporters import export_document
 from .http_client import SourceAuthError, SourceClient
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
@@ -618,3 +630,299 @@ class Crawler:
         if self._docs_since_gc >= self._gc_interval:
             self._docs_since_gc = 0
             gc.collect()
+
+    # --- full catalog scan ------------------------------------------------
+
+    def run_catalog_scan(
+        self,
+        scan_id: str,
+        list_url: str = DEFAULT_ALL_DOCUMENTS_LIST_URL,
+        max_pages: int | None = None,
+        max_docs: int | None = None,
+        lease_seconds: int = 1800,
+        poll_interval: float = 5.0,
+    ) -> CatalogScanState:
+        """Enumerate the whole catalog once, then export everything it listed.
+
+        The scan is identified by ``scan_id`` and is resumable: a restarted
+        container repeats the same command, picks up the persisted page cursor
+        and never downloads a document that is already exported in full. Once
+        the scan is completed the same command becomes a no-op.
+        """
+        state = self.store.ensure_catalog_scan(scan_id, list_url, self.product, self.formats)
+        if state.phase == PHASE_COMPLETED:
+            print(f"[catalog] {scan_id}: скан уже завершен {state.completed_at}, ничего не делаю")
+            return state
+
+        reclaimed = self.store.reclaim_catalog_scan_documents(scan_id)
+        if reclaimed:
+            print(f"[catalog] {scan_id}: возвращено в очередь после перезапуска: {reclaimed}")
+
+        print(
+            f"[catalog] {scan_id}: старт, фаза {state.phase}, страница {state.next_page}"
+            + (f"/{state.total_pages}" if state.total_pages else "")
+            + f", форматы {','.join(self.formats)}"
+        )
+        self.store.set_catalog_scan_phase(scan_id, PHASE_ENUMERATING)
+        enumeration_error: str | None = None
+        try:
+            self._enumerate_catalog(scan_id, state, list_url, max_pages, max_docs)
+        except SourceAuthError as exc:
+            self._abort_catalog_scan(scan_id, exc)
+            raise
+        except CatalogDiscoveryError as exc:
+            self.store.set_catalog_scan_phase(scan_id, PHASE_ABORTED, error=sanitize_detail(str(exc)))
+            raise
+        except Exception as exc:
+            # A broken listing page must not silently skip its documents: stop
+            # enumerating, still export what is already queued, and resume later.
+            enumeration_error = sanitize_detail(f"{type(exc).__name__}: {exc}")
+            print(f"[catalog] {scan_id}: обход списка остановлен: {enumeration_error}")
+
+        self.store.set_catalog_scan_phase(scan_id, PHASE_DRAINING, error=enumeration_error)
+        try:
+            processed = self._drain_catalog_queue(scan_id, lease_seconds=lease_seconds, poll_interval=poll_interval)
+        except SourceAuthError as exc:
+            self._abort_catalog_scan(scan_id, exc)
+            raise
+
+        resolved = self.store.resolve_catalog_scan_outcomes(scan_id)
+        pending = self.store.pending_catalog_document_count(scan_id)
+        state = self.store.get_catalog_scan(scan_id)
+        enumeration_done = state.total_pages is not None and state.next_page > state.total_pages
+        if enumeration_done and pending == 0 and enumeration_error is None:
+            self.store.set_catalog_scan_phase(scan_id, PHASE_COMPLETED)
+        else:
+            reason = enumeration_error or (
+                f"enumeration stopped at page {state.next_page}"
+                if not enumeration_done
+                else f"{pending} documents still pending"
+            )
+            self.store.set_catalog_scan_phase(scan_id, PHASE_PAUSED, error=reason)
+
+        state = self.store.get_catalog_scan(scan_id)
+        stats = self.store.catalog_scan_stats(scan_id)
+        print(
+            f"[catalog] {scan_id}: фаза {state.phase}, обработано за запуск {processed}, "
+            f"страниц {state.pages_done}/{state.total_pages}, документов {state.docs_seen}, "
+            f"итоги {stats}" + (f", закрыто по exported {resolved}" if resolved else "")
+        )
+        return state
+
+    def _abort_catalog_scan(self, scan_id: str, exc: BaseException) -> None:
+        error = sanitize_detail(f"auth: {exc}")
+        self.store.set_catalog_scan_phase(scan_id, PHASE_ABORTED, error=error)
+        print(f"[catalog] {scan_id}: скан прерван из-за авторизации PRG")
+
+    def _enumerate_catalog(
+        self,
+        scan_id: str,
+        state: CatalogScanState,
+        list_url: str,
+        max_pages: int | None,
+        max_docs: int | None,
+    ) -> None:
+        page = max(1, state.next_page)
+        total_pages = state.total_pages
+        pages_fetched = 0
+        docs_this_run = 0
+
+        while total_pages is None or page <= total_pages:
+            if max_pages is not None and pages_fetched >= max_pages:
+                print(f"[catalog] {scan_id}: достигнут --max-pages, остановка на странице {page}")
+                return
+            if max_docs is not None and docs_this_run >= max_docs:
+                print(f"[catalog] {scan_id}: достигнут --max-docs, остановка на странице {page}")
+                return
+
+            listing = fetch_listing_page(self.client, page=page, list_url=list_url)
+            pages_fetched += 1
+            refs = listing.documents
+
+            if total_pages is None:
+                if listing.total is None or not refs:
+                    raise CatalogDiscoveryError(
+                        f"Catalog listing page {page} returned no document total or no documents; "
+                        "refusing to guess the catalog size."
+                    )
+                page_size = len(refs)
+                total_pages = (int(listing.total) + page_size - 1) // page_size
+                self.store.set_catalog_scan_discovery(
+                    scan_id,
+                    total_documents=int(listing.total),
+                    page_size=page_size,
+                    total_pages=total_pages,
+                )
+                print(
+                    f"[catalog] {scan_id}: всего документов {listing.total}, "
+                    f"по {page_size} на странице, страниц {total_pages}"
+                )
+
+            truncated = False
+            if max_docs is not None and docs_this_run + len(refs) > max_docs:
+                refs = refs[: max(0, max_docs - docs_this_run)]
+                truncated = True
+
+            self.store.record_catalog_page(scan_id, page, refs)
+            added = self.store.enqueue_document_refs(
+                refs,
+                depth=0,
+                force=self.force,
+                formats=self.formats,
+                retry_failed=True,
+            )
+            docs_this_run += len(refs)
+            print(
+                f"[catalog] {scan_id}: страница {page}/{total_pages}: "
+                f"документов {len(refs)}, в очередь {added}"
+            )
+            if truncated:
+                # The page is only half consumed, so the cursor stays put and a
+                # later run reads it again from the start. Re-stating the current
+                # page still refreshes the counters.
+                self.store.advance_catalog_scan(scan_id, next_page=page)
+                print(f"[catalog] {scan_id}: достигнут --max-docs внутри страницы {page}")
+                return
+            self.store.advance_catalog_scan(scan_id, next_page=page + 1, docs_enqueued=added)
+            page += 1
+            time.sleep(self.delay)
+
+    def _drain_catalog_queue(self, scan_id: str, lease_seconds: int, poll_interval: float) -> int:
+        stale = self.store.requeue_stale_documents(lease_seconds)
+        if stale:
+            print(f"[catalog] {scan_id}: возвращено зависших processing -> queued: {stale}")
+
+        worker_prefix = f"catalog:{scan_id}:{socket.gethostname()}:{os.getpid()}"
+        state = {"claimed": 0, "processed": 0, "active": 0, "stop": False}
+        state_lock = threading.Lock()
+
+        def worker_loop(worker_number: int) -> None:
+            worker_id = f"{worker_prefix}:{worker_number}"
+            while True:
+                with state_lock:
+                    if state["stop"]:
+                        return
+                item = self.store.claim_queued_document(worker_id)
+                if item is None:
+                    stale_count = self.store.requeue_stale_documents(lease_seconds)
+                    if stale_count:
+                        continue
+                    with state_lock:
+                        if int(state["active"]) == 0:
+                            state["stop"] = True
+                            return
+                    time.sleep(max(0.1, poll_interval))
+                    continue
+
+                ref, depth = item
+                with state_lock:
+                    state["claimed"] += 1
+                    state["active"] += 1
+                    index = int(state["claimed"])
+                try:
+                    self._process_catalog_ref(scan_id, ref, index=index, depth=depth)
+                except SourceAuthError:
+                    with state_lock:
+                        state["stop"] = True
+                    raise
+                finally:
+                    with state_lock:
+                        state["processed"] += 1
+                        state["active"] -= 1
+
+        if self.workers == 1:
+            worker_loop(1)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = [executor.submit(worker_loop, number) for number in range(1, self.workers + 1)]
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+        return int(state["processed"])
+
+    def _process_catalog_ref(self, scan_id: str, ref: DocumentRef, index: int, depth: int = 0) -> None:
+        """Export one claimed document and record its outcome for the scan.
+
+        Documents that the queue holds for other reasons are still processed,
+        they just do not get a scan outcome row.
+        """
+        doc_id = ref.doc_id
+        member = self.store.is_catalog_scan_member(scan_id, doc_id)
+
+        if not self.force and self.store.has_document_outputs(doc_id, self.formats):
+            self.store.upsert_document(
+                doc_id,
+                "exported",
+                title=ref.title,
+                source_url=ref.source_url,
+                formats=self.formats,
+            )
+            if member:
+                self.store.record_catalog_document_outcome(scan_id, doc_id, OUTCOME_DONE)
+            print(f"[catalog] {index} {doc_id}: уже готово, пропускаю")
+            return
+
+        print(f"[catalog] {index} {doc_id}: загрузка")
+        try:
+            downloader = DocumentDownloader(self.client, product=self.product, only_free=self.only_free)
+            document = downloader.fetch_document(doc_id)
+            pages = len(document.raw.get("pages") or [])
+            self.store.upsert_document(
+                doc_id,
+                "processing",
+                title=document.title,
+                source_url=ref.source_url,
+                is_free=document.is_free,
+                pages=pages,
+            )
+            paths = export_document(document, self.out_dir, self.formats)
+            self.store.save_document_outputs(document, paths)
+            self.store.upsert_document(
+                doc_id,
+                "exported",
+                title=document.title,
+                source_url=ref.source_url,
+                is_free=document.is_free,
+                pages=pages,
+                formats=self.formats,
+            )
+            if member:
+                self.store.record_catalog_document_outcome(scan_id, doc_id, OUTCOME_DONE)
+            outputs = ", ".join(f"{key}:{path.name}" for key, path in paths.items() if key != "meta")
+            print(f"[catalog] {index} {doc_id}: готово ({outputs})")
+        except SourceAuthError:
+            # Fatal for the whole scan: hand the claimed document back untouched
+            # instead of blaming it for a broken PRG session.
+            self.store.enqueue_document_refs([ref], depth=depth, force=True, formats=self.formats)
+            raise
+        except Exception as exc:
+            outcome, failure_kind, http_status = classify_document_failure(exc)
+            metadata = getattr(exc, "metadata", None) if isinstance(
+                exc, (DocumentNotFreeError, DocumentUnavailableError)
+            ) else None
+            self.store.upsert_document(
+                doc_id,
+                "failed",
+                title=(metadata.title if metadata else "") or ref.title,
+                source_url=ref.source_url,
+                is_free=metadata.is_free if metadata else None,
+                pages=metadata.pages if metadata else None,
+                error=str(exc),
+            )
+            if member:
+                self.store.record_catalog_document_outcome(
+                    scan_id,
+                    doc_id,
+                    outcome,
+                    failure_kind=failure_kind,
+                    http_status=http_status,
+                    detail=str(exc),
+                )
+            print(f"[catalog] {index} {doc_id}: {outcome}/{failure_kind}")
+        finally:
+            if getattr(self.store, "stores_document_outputs", False):
+                try:
+                    cleanup_document_exports(self.out_dir, doc_id)
+                except OSError as cleanup_error:
+                    print(f"[catalog] {index} {doc_id}: не удалось очистить временные файлы: {cleanup_error}")
+            self._maybe_collect_garbage()
+            time.sleep(self.delay)

@@ -36,6 +36,20 @@ class DocumentNotFreeError(PermissionError):
         self.metadata = metadata
 
 
+class DocumentUnavailableError(ValueError):
+    """The source acknowledged the document but returned no readable content.
+
+    Subclasses ValueError so callers written before the catalog scan keep the
+    old behaviour, while the catalog scan can record it as a terminal
+    "inaccessible" stub instead of a retryable error.
+    """
+
+    def __init__(self, metadata: DocumentMetadata, reason: str) -> None:
+        super().__init__(f"Document {metadata.doc_id} is unavailable: {reason}")
+        self.metadata = metadata
+        self.reason = reason
+
+
 def document_metadata_from_response(doc_id: str, data: dict[str, Any]) -> DocumentMetadata:
     raw_is_free = data.get("isDocumentFree")
     pages = data.get("pages")
@@ -162,7 +176,7 @@ class DocumentDownloader:
 
         pages = first.get("pages") or []
         if not pages:
-            raise ValueError(f"Document {doc_id} has no pages in API response.")
+            raise DocumentUnavailableError(metadata, "the API response contains no pages")
 
         collected_pages: list[dict[str, Any]] = [dict(page or {}) for page in pages]
         total_pages = len(collected_pages)

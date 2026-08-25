@@ -20,6 +20,37 @@ LOGIN_PAGE = """<!DOCTYPE html>
 
 WELCOME_PAGE = "<!DOCTYPE html><html><body><p>prg.kz</p></body></html>"
 
+CATALOG_PAGE = """<!DOCTYPE html>
+<html><body>
+  <div class="summary">{total_line}</div>
+  {links}
+</body></html>
+"""
+
+
+def make_document_payload(doc_id: str, title: str = "", is_free: bool = True, pages: int = 1) -> dict:
+    """A minimal GetDocument response shaped like the PRG API."""
+    return {
+        "name": title or f"Документ {doc_id}",
+        "isDocumentFree": is_free,
+        "style": "",
+        "pages": [
+            {
+                "paragpraphs": [
+                    {"paragraphId": index + 1, "html": f"<p>{doc_id} часть {index + 1}</p>"}
+                ]
+            }
+            for index in range(pages)
+        ],
+    }
+
+
+def make_empty_document_payload(doc_id: str, title: str = "", is_free: bool = True) -> dict:
+    """A response the source accepts but that carries no readable page."""
+    payload = make_document_payload(doc_id, title=title, is_free=is_free)
+    payload["pages"] = []
+    return payload
+
 
 class FakeSourceState:
     """Recorded traffic and behaviour switches for :class:`FakeSourceServer`."""
@@ -40,6 +71,31 @@ class FakeSourceState:
         self.issued_tokens: list[str] = []
         self.sessions: dict[str, int] = {}
         self._session_counter = 0
+        # Catalog listing (/catalog) and document API (/mapi/...) fixtures.
+        self.catalog_doc_ids: list[str] = []
+        self.catalog_page_size = 2
+        self.catalog_total: int | None = None
+        self.catalog_page_hits: list[int] = []
+        self.documents: dict[str, dict] = {}
+        self.document_status: dict[str, int] = {}
+        self.document_hits: list[str] = []
+
+    def load_catalog(self, doc_ids: list[str], page_size: int = 2, total: int | None = None) -> None:
+        self.catalog_doc_ids = list(doc_ids)
+        self.catalog_page_size = page_size
+        self.catalog_total = len(doc_ids) if total is None else total
+        for doc_id in doc_ids:
+            self.documents.setdefault(doc_id, make_document_payload(doc_id))
+
+    def catalog_page(self, page: int) -> list[str]:
+        with self.lock:
+            self.catalog_page_hits.append(page)
+        start = (page - 1) * self.catalog_page_size
+        return self.catalog_doc_ids[start : start + self.catalog_page_size]
+
+    def record_document_hit(self, doc_id: str) -> None:
+        with self.lock:
+            self.document_hits.append(doc_id)
 
     def issue_token(self) -> str:
         with self.lock:
@@ -140,6 +196,21 @@ class FakeSourceServer:
                     self._send(200, json.dumps({"public": True}), "application/json")
                 elif path.startswith("/mapi/"):
                     if state.use_session(self._session()):
+                        doc_id = path.rstrip("/").split("/")[-2] if path.count("/") >= 6 else ""
+                        forced = state.document_status.get(doc_id)
+                        if forced:
+                            state.record_document_hit(doc_id)
+                            self._send(
+                                forced,
+                                json.dumps({"error": "denied", "secret": "must-not-leak"}),
+                                "application/json",
+                            )
+                            return
+                        payload = state.documents.get(doc_id)
+                        if payload is not None:
+                            state.record_document_hit(doc_id)
+                            self._send(200, json.dumps(payload), "application/json")
+                            return
                         self._send(200, json.dumps({"ok": True, "path": path}), "application/json")
                     elif state.protected_status in {401, 403}:
                         self._send(
@@ -149,6 +220,18 @@ class FakeSourceServer:
                         )
                     else:
                         self._send(302, "", "text/html", [("Location", "/account/login")])
+                elif path == "/catalog":
+                    if not state.use_session(self._session()):
+                        self._send(302, "", "text/html", [("Location", "/account/login")])
+                        return
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    page = int((query.get("currentPage") or ["1"])[0])
+                    links = "\n".join(
+                        f"<a href='/lawyer/document/?doc_id={doc_id}'>Документ {doc_id}</a>"
+                        for doc_id in state.catalog_page(page)
+                    )
+                    total_line = "" if state.catalog_total is None else f"Документов: {state.catalog_total}"
+                    self._send(200, CATALOG_PAGE.format(total_line=total_line, links=links), "text/html")
                 elif path == "/listing":
                     if state.use_session(self._session()):
                         self._send(200, "<a href='/lawyer/document/?doc_id=42'>Doc</a>", "text/html")

@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from pathlib import Path
 from typing import Iterable
 
+from .catalog import (
+    OUTCOME_DONE,
+    OUTCOME_PENDING,
+    PHASE_COMPLETED,
+    PHASE_PENDING,
+    CatalogScanState,
+    build_stub,
+    format_list,
+    parse_format_list,
+)
 from .document import DocumentData
 from .listing import DocumentRef
 from .utils import now_iso
@@ -53,6 +64,10 @@ class PostgresCrawlStore:
                 """
                 CREATE TABLE IF NOT EXISTS documents (
                     doc_id TEXT PRIMARY KEY,
+                    source_system TEXT NOT NULL DEFAULT 'prg_zanger'
+                        CHECK (source_system = 'prg_zanger'),
+                    corpus_type TEXT NOT NULL DEFAULT 'legal_act'
+                        CHECK (corpus_type = 'legal_act'),
                     title TEXT,
                     source_url TEXT,
                     status TEXT NOT NULL,
@@ -64,6 +79,14 @@ class PostgresCrawlStore:
                     updated_at TIMESTAMPTZ NOT NULL
                 )
                 """
+            )
+            cur.execute(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_system "
+                "TEXT NOT NULL DEFAULT 'prg_zanger' CHECK (source_system = 'prg_zanger')"
+            )
+            cur.execute(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS corpus_type "
+                "TEXT NOT NULL DEFAULT 'legal_act' CHECK (corpus_type = 'legal_act')"
             )
             cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS queue_depth INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS locked_by TEXT")
@@ -164,7 +187,57 @@ class PostgresCrawlStore:
             )
             cur.execute("CREATE INDEX IF NOT EXISTS document_outputs_format_idx ON document_outputs(format)")
             cur.execute("CREATE INDEX IF NOT EXISTS document_links_linked_idx ON document_links(linked_doc_id)")
+            self._init_catalog_schema(cur)
             self._conn.commit()
+
+    def _init_catalog_schema(self, cur) -> None:
+        """Catalog scan state, kept apart from the legacy listing_* tables."""
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS catalog_scans (
+                scan_id TEXT PRIMARY KEY,
+                list_url TEXT NOT NULL,
+                product TEXT NOT NULL,
+                formats TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                total_documents INTEGER,
+                page_size INTEGER,
+                total_pages INTEGER,
+                next_page INTEGER NOT NULL DEFAULT 1,
+                pages_done INTEGER NOT NULL DEFAULT 0,
+                docs_seen BIGINT NOT NULL DEFAULT 0,
+                docs_enqueued BIGINT NOT NULL DEFAULT 0,
+                error TEXT,
+                started_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS catalog_scan_documents (
+                scan_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '',
+                source_url TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT 'pending',
+                failure_kind TEXT,
+                http_status INTEGER,
+                stub JSONB,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (scan_id, doc_id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS catalog_scan_documents_outcome_idx
+            ON catalog_scan_documents(scan_id, outcome)
+            """
+        )
 
     def mark_listing_page(
         self,
@@ -399,6 +472,7 @@ class PostgresCrawlStore:
         depth: int = 0,
         force: bool = False,
         formats: Iterable[str] = (),
+        retry_failed: bool = False,
     ) -> int:
         now = now_iso()
         added = 0
@@ -434,7 +508,8 @@ class PostgresCrawlStore:
                     elif status == "exported":
                         outputs_ready = True
 
-                    if not force and (outputs_ready or status == "processing" or (status == "failed" and terminal_failed)):
+                    skip_failed = terminal_failed and not retry_failed
+                    if not force and (outputs_ready or status == "processing" or (status == "failed" and skip_failed)):
                         cur.execute(
                             """
                             UPDATE documents
@@ -744,3 +819,322 @@ class PostgresCrawlStore:
                     (document.doc_id, linked_doc_id, position, now),
                 )
             self._conn.commit()
+
+    # --- catalog scan -----------------------------------------------------
+
+    CATALOG_SCAN_COLUMNS = (
+        "scan_id, list_url, product, formats, phase, total_documents, page_size, total_pages, "
+        "next_page, pages_done, docs_seen, docs_enqueued, error, started_at, updated_at, completed_at"
+    )
+
+    @staticmethod
+    def _timestamp_text(value: object) -> str:
+        if value is None:
+            return ""
+        isoformat = getattr(value, "isoformat", None)
+        return isoformat() if callable(isoformat) else str(value)
+
+    def _catalog_scan_from_row(self, row: tuple) -> CatalogScanState:
+        return CatalogScanState(
+            scan_id=str(row[0]),
+            list_url=str(row[1]),
+            product=str(row[2]),
+            formats=parse_format_list(row[3]),
+            phase=str(row[4]),
+            total_documents=None if row[5] is None else int(row[5]),
+            page_size=None if row[6] is None else int(row[6]),
+            total_pages=None if row[7] is None else int(row[7]),
+            next_page=int(row[8] or 1),
+            pages_done=int(row[9] or 0),
+            docs_seen=int(row[10] or 0),
+            docs_enqueued=int(row[11] or 0),
+            error=None if row[12] is None else str(row[12]),
+            started_at=self._timestamp_text(row[13]),
+            updated_at=self._timestamp_text(row[14]),
+            completed_at=self._timestamp_text(row[15]) or None,
+        )
+
+    def get_catalog_scan(self, scan_id: str) -> CatalogScanState | None:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {self.CATALOG_SCAN_COLUMNS} FROM catalog_scans WHERE scan_id = %s",
+                (scan_id,),
+            )
+            row = cur.fetchone()
+        return self._catalog_scan_from_row(row) if row else None
+
+    def ensure_catalog_scan(
+        self,
+        scan_id: str,
+        list_url: str,
+        product: str,
+        formats: Iterable[str],
+    ) -> CatalogScanState:
+        """Create the scan row once and refuse to reuse an id with other settings."""
+        formats_text = format_list(tuple(formats))
+        now = now_iso()
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO catalog_scans(
+                    scan_id, list_url, product, formats, phase, next_page,
+                    pages_done, docs_seen, docs_enqueued, started_at, updated_at
+                )
+                VALUES(%s, %s, %s, %s, %s, 1, 0, 0, 0, %s, %s)
+                ON CONFLICT(scan_id) DO NOTHING
+                """,
+                (scan_id, list_url, product, formats_text, PHASE_PENDING, now, now),
+            )
+            cur.execute(
+                f"SELECT {self.CATALOG_SCAN_COLUMNS} FROM catalog_scans WHERE scan_id = %s",
+                (scan_id,),
+            )
+            row = cur.fetchone()
+            self._conn.commit()
+        state = self._catalog_scan_from_row(row)
+        mismatch = [
+            f"{name}: scan has {stored!r}, run asked for {given!r}"
+            for name, stored, given in (
+                ("list-url", state.list_url, list_url),
+                ("product", state.product, product),
+                ("formats", format_list(state.formats), formats_text),
+            )
+            if stored != given
+        ]
+        if mismatch:
+            raise ValueError(
+                f"Catalog scan '{scan_id}' was started with a different configuration ("
+                + "; ".join(mismatch)
+                + "). Use a new --scan-id or repeat the original settings."
+            )
+        return state
+
+    def set_catalog_scan_discovery(
+        self,
+        scan_id: str,
+        total_documents: int,
+        page_size: int,
+        total_pages: int,
+    ) -> None:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE catalog_scans
+                SET total_documents=%s, page_size=%s, total_pages=%s, updated_at=%s
+                WHERE scan_id = %s
+                """,
+                (total_documents, page_size, total_pages, now_iso(), scan_id),
+            )
+            self._conn.commit()
+
+    def set_catalog_scan_phase(self, scan_id: str, phase: str, error: str | None = None) -> None:
+        now = now_iso()
+        completed_at = now if phase == PHASE_COMPLETED else None
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE catalog_scans
+                SET phase=%s,
+                    error=%s,
+                    completed_at=COALESCE(%s::timestamptz, completed_at),
+                    updated_at=%s
+                WHERE scan_id = %s
+                """,
+                (phase, error, completed_at, now, scan_id),
+            )
+            self._conn.commit()
+
+    def record_catalog_page(self, scan_id: str, page: int, refs: Iterable[DocumentRef]) -> int:
+        """Store the membership of one listing page without touching outcomes."""
+        now = now_iso()
+        rows = [
+            (scan_id, ref.doc_id, page, index, ref.title, ref.source_url, OUTCOME_PENDING, now)
+            for index, ref in enumerate(refs)
+        ]
+        if not rows:
+            return 0
+        with self._lock, self._conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO catalog_scan_documents(
+                    scan_id, doc_id, page, position, title, source_url, outcome, updated_at
+                )
+                VALUES(%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT(scan_id, doc_id) DO UPDATE SET
+                    page=excluded.page,
+                    position=excluded.position,
+                    title=COALESCE(NULLIF(excluded.title, ''), catalog_scan_documents.title),
+                    source_url=COALESCE(NULLIF(excluded.source_url, ''), catalog_scan_documents.source_url),
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            self._conn.commit()
+        return len(rows)
+
+    def advance_catalog_scan(self, scan_id: str, next_page: int, docs_enqueued: int = 0) -> None:
+        """Move the resume cursor forward; replaying a page never moves it back."""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE catalog_scans
+                SET docs_enqueued=docs_enqueued + CASE WHEN %s > next_page THEN %s ELSE 0 END,
+                    next_page=GREATEST(next_page, %s),
+                    pages_done=GREATEST(pages_done, %s - 1),
+                    docs_seen=(SELECT COUNT(*) FROM catalog_scan_documents WHERE scan_id = %s),
+                    updated_at=%s
+                WHERE scan_id = %s
+                """,
+                (next_page, docs_enqueued, next_page, next_page, scan_id, now_iso(), scan_id),
+            )
+            self._conn.commit()
+
+    def is_catalog_scan_member(self, scan_id: str, doc_id: str) -> bool:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM catalog_scan_documents WHERE scan_id = %s AND doc_id = %s",
+                (scan_id, doc_id),
+            )
+            row = cur.fetchone()
+        return row is not None
+
+    def record_catalog_document_outcome(
+        self,
+        scan_id: str,
+        doc_id: str,
+        outcome: str,
+        failure_kind: str | None = None,
+        http_status: int | None = None,
+        detail: str = "",
+    ) -> dict[str, object] | None:
+        """Record a terminal outcome; failures keep a credential-free JSON stub."""
+        now = now_iso()
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT page, position, title, source_url
+                FROM catalog_scan_documents
+                WHERE scan_id = %s AND doc_id = %s
+                """,
+                (scan_id, doc_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                self._conn.commit()
+                return None
+            stub = None
+            if outcome != OUTCOME_DONE:
+                stub = build_stub(
+                    scan_id=scan_id,
+                    doc_id=doc_id,
+                    outcome=outcome,
+                    page=int(row[0]),
+                    position=int(row[1] or 0),
+                    title=str(row[2] or ""),
+                    source_url=str(row[3] or ""),
+                    failure_kind=failure_kind,
+                    http_status=http_status,
+                    detail=detail,
+                    recorded_at=now,
+                )
+            cur.execute(
+                """
+                UPDATE catalog_scan_documents
+                SET outcome=%s, failure_kind=%s, http_status=%s, stub=%s::jsonb, updated_at=%s
+                WHERE scan_id = %s AND doc_id = %s
+                """,
+                (
+                    outcome,
+                    failure_kind if stub else None,
+                    http_status if stub else None,
+                    json.dumps(stub, ensure_ascii=False) if stub else None,
+                    now,
+                    scan_id,
+                    doc_id,
+                ),
+            )
+            self._conn.commit()
+        return stub
+
+    def resolve_catalog_scan_outcomes(self, scan_id: str) -> int:
+        """Close out members that another run already exported."""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE catalog_scan_documents AS members
+                SET outcome=%s, failure_kind=NULL, http_status=NULL, stub=NULL, updated_at=%s
+                FROM documents
+                WHERE members.scan_id = %s
+                  AND members.outcome = %s
+                  AND documents.doc_id = members.doc_id
+                  AND documents.status = 'exported'
+                """,
+                (OUTCOME_DONE, now_iso(), scan_id, OUTCOME_PENDING),
+            )
+            count = cur.rowcount
+            self._conn.commit()
+        return int(count or 0)
+
+    def pending_catalog_document_count(self, scan_id: str) -> int:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM catalog_scan_documents WHERE scan_id = %s AND outcome = %s",
+                (scan_id, OUTCOME_PENDING),
+            )
+            row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def reclaim_catalog_scan_documents(self, scan_id: str) -> int:
+        """Return this scan's documents left in processing by a dead container."""
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET status='queued', locked_by=NULL, locked_at=NULL, updated_at=now()
+                WHERE status = 'processing'
+                  AND doc_id IN (
+                      SELECT doc_id FROM catalog_scan_documents WHERE scan_id = %s AND outcome = %s
+                  )
+                """,
+                (scan_id, OUTCOME_PENDING),
+            )
+            count = cur.rowcount
+            self._conn.commit()
+        return int(count or 0)
+
+    def catalog_scan_stats(self, scan_id: str) -> dict[str, int]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT outcome, COUNT(*)
+                FROM catalog_scan_documents
+                WHERE scan_id = %s
+                GROUP BY outcome
+                """,
+                (scan_id,),
+            )
+            rows = cur.fetchall()
+        return {str(outcome): int(count) for outcome, count in rows}
+
+    def catalog_scan_stubs(self, scan_id: str) -> list[dict[str, object]]:
+        with self._lock, self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT stub
+                FROM catalog_scan_documents
+                WHERE scan_id = %s AND stub IS NOT NULL
+                ORDER BY page, position, doc_id
+                """,
+                (scan_id,),
+            )
+            rows = cur.fetchall()
+        stubs: list[dict[str, object]] = []
+        for (stub,) in rows:
+            if isinstance(stub, dict):
+                stubs.append(stub)
+            elif stub:
+                try:
+                    stubs.append(json.loads(str(stub)))
+                except json.JSONDecodeError:
+                    continue
+        return stubs

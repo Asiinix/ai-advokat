@@ -1,6 +1,6 @@
 # AI Advokat Parser
 
-Парсер и очередь загрузки юридических документов для AI Advokat. Текущий адаптер получает исходные документы из PRG.ZANGER.
+Парсер и очередь загрузки юридических документов для AI Advokat. Два изолированных конвейера: исходные документы PRG.ZANGER (законодательство) и судебные акты PRG.SOT.
 
 Проект умеет:
 
@@ -200,6 +200,145 @@ Failed-документы, которые оказались платными, �
 ```text
 --out /tmp/ai-advokat-data --workers 1 --delay 0 enrich-failed-titles
 ```
+
+## Полный обход каталога (catalog-scan)
+
+`catalog-scan` проходит весь каталог источника, а не только бесплатную выборку.
+Он ходит по `/lawyer/documents` с `onlyFreeDocuments=false`, поэтому в скан попадают и платные документы.
+Обычные команды (`range`, `pipeline`, `list`) продолжают использовать прежний бесплатный список.
+
+```text
+--out /tmp/ai-advokat-data --formats html,txt,json --delay 0 catalog-scan --scan-id catalog-2026-08
+```
+
+Что делает скан:
+
+- `--scan-id` обязателен и задает один долгий проход. Повтор той же команды продолжает этот же скан;
+- страницы списка читаются последовательно, состав каждой страницы пишется в `catalog_scan_documents`;
+- документы ставятся в общую очередь и скачиваются после того, как перечисление закончилось;
+- уже готовые документы (`exported` со всеми запрошенными форматами) не скачиваются повторно;
+- документы, которые раньше упали как платные, недоступные или сломанные, ставятся в очередь заново;
+- недоступные документы не роняют скан: по каждому пишется JSON-заглушка;
+- когда скан завершен, та же команда ничего не делает и сразу выходит.
+
+Состояние скана живет в двух таблицах, отдельно от старых `listing_pages`/`listing_documents`:
+
+- `catalog_scans` - фаза (`pending`, `enumerating`, `draining`, `paused`, `completed`, `aborted`), общий размер каталога, размер страницы, курсор `next_page` и счетчики;
+- `catalog_scan_documents` - состав скана и итог по каждому документу: `done`, `inaccessible`, `not_found`, `failed`.
+
+Итоги по документам:
+
+- `done` - документ выгружен во все запрошенные форматы;
+- `inaccessible` - источник не отдает содержимое авторизованной сессии: платный документ, HTTP 402/403, логин-стена после успешного перелогина или ответ без страниц;
+- `not_found` - HTTP 404;
+- `failed` - остальные ошибки запроса, разбора или экспорта после исчерпания повторов.
+
+Все, кроме `done`, получает заглушку: `scan_id`, `doc_id`, `page`, `position`, `title`, `source_url`, `outcome`, `failure_kind`, `http_status`, короткий `detail` и время.
+В заглушку не попадают тела ответов, cookie, токены и учетные данные.
+Если документ позже скачался, заглушка снимается, а итог становится `done`.
+
+Ошибка авторизации PRG - фатальная: скан переходит в `aborted`, взятый в работу документ возвращается в очередь и не помечается как `failed`, процесс выходит с ненулевым кодом.
+После исправления учетных данных достаточно повторить ту же команду.
+
+Прогресс и заглушки:
+
+```bash
+python3 -m ai_advokat_parser --out /tmp/ai-advokat-data catalog-status --scan-id catalog-2026-08
+python3 -m ai_advokat_parser --out /tmp/ai-advokat-data catalog-stubs --scan-id catalog-2026-08 --output stubs.json
+```
+
+`catalog-stubs` без `--output` печатает JSON в stdout.
+
+Ограничители для проверочных запусков:
+
+```text
+--out /tmp/ai-advokat-data --formats html,txt,json --delay 0 catalog-scan --scan-id catalog-2026-08 --max-pages 2
+```
+
+`--max-pages` и `--max-docs` не закрывают скан: он останавливается в фазе `paused`, а следующий запуск с тем же `--scan-id` продолжает с той же страницы.
+Поэтому маленький smoke-run нельзя перепутать с полностью пройденным каталогом.
+
+Ограничения:
+
+- `catalog-scan` не ходит по ссылкам документов, запуск с `--follow-links-depth` больше нуля отклоняется;
+- если страница списка не отдала общее число документов, скан падает и не пытается угадать размер каталога;
+- sitemap источника пока не используется: он нужен как будущий источник сверки, а не как источник истины.
+
+### Railway
+
+Команда для `AI_ADVOCAT_COMMAND` (учетные данные остаются в отдельных переменных):
+
+```text
+--out /tmp/ai-advokat-data --formats html,txt,json --workers 3 --delay 0 catalog-scan --scan-id catalog-2026-08
+```
+
+После перезапуска контейнера Railway снова выполнит ту же строку: скан продолжится с сохраненной страницы, а зависшие `processing` документы этого скана вернутся в очередь.
+
+## PRG.SOT (судебные акты)
+
+Второй конвейер собирает судебные акты PRG.SOT (`sb.prg.kz`) и живет рядом с PRG.ZANGER, нигде с ним не пересекаясь:
+
+- локально — отдельный файл состояния `sot_state.sqlite3` и таблицы `sot_scans`, `sot_decisions`, `sot_decision_outputs`, `sot_scan_decisions`;
+- в Postgres — те же таблицы `sot_*` в общей базе рядом с таблицами ZANGER; таблицы `documents`/`document_outputs` не читаются и не переписываются;
+- ключ каждого решения начинается с `prg_sot:`, поэтому он не может совпасть с `doc_id`;
+- поисковый слой (`services/knowledge`) индексирует корпуса в разные таблицы очереди и разные индексы Elasticsearch.
+
+### Конфигурация источника
+
+Репозиторий не знает настоящих маршрутов PRG.SOT (они за платным входом) и ничего не выдумывает. Оператор снимает два запроса из живой подписанной сессии (DevTools → Network → Copy as cURL) и заполняет переменные окружения:
+
+```text
+AI_ADVOCAT_SOT_USERNAME=...
+AI_ADVOCAT_SOT_PASSWORD=...
+AI_ADVOCAT_SOT_BASE_URL=https://sb.prg.kz
+AI_ADVOCAT_SOT_SEARCH_URL_TEMPLATE=...   # обязателен один из {page}/{offset}/{cursor}
+AI_ADVOCAT_SOT_DECISION_URL_TEMPLATE=... # обязателен {decision_id}
+AI_ADVOCAT_SOT_RESULTS_PATH=data.items
+AI_ADVOCAT_SOT_ID_PATH=id
+AI_ADVOCAT_SOT_TEXT_PATH=decision.body
+```
+
+Опционально: `AI_ADVOCAT_SOT_TOTAL_PATH`, `AI_ADVOCAT_SOT_NEXT_CURSOR_PATH`, `AI_ADVOCAT_SOT_PAGE_SIZE`, `AI_ADVOCAT_SOT_QUERY`, `AI_ADVOCAT_SOT_DECISION_PAGE_URL_TEMPLATE` и `AI_ADVOCAT_SOT_FIELD_MAP` — JSON вида `поле -> путь` для полей `case_number`, `court`, `judge`, `region`, `instance`, `proceeding_type`, `decision_date`, `title`, `parties`. Шаблоны обязаны указывать на `AI_ADVOCAT_SOT_BASE_URL` — иначе сессионный cookie ушел бы чужому origin. Пока контракт не заполнен полностью, `sot-scan` падает до первой записи скана; `sot-status` и проверка только логина остаются доступны.
+
+### Живая проверка перед сканом (гейт валидации)
+
+`sot-probe-auth` — единственная команда, которая обращается к источнику и ничего не записывает. Без `--page` код выхода `0` подтверждает только успешный вход в PRG.SOT. С `--page` читается ровно одна страница, и код `0` дополнительно означает, что снятый контракт совпал с ответом источника.
+
+```bash
+python3 -m ai_advokat_parser sot-probe-auth
+python3 -m ai_advokat_parser sot-probe-auth --page 1
+```
+
+### Команды
+
+```text
+--out /tmp/ai-advokat-sot sot-scan --scan-id sot-2026-08
+```
+
+Скан перечисляет страницы поиска, ставит решения в очередь и докачивает их; повтор той же команды продолжает тот же скан. `--max-pages`/`--max-decisions` дают smoke-run в фазе `paused`, `--retry-failed` явно возвращает в очередь failed/inaccessible/not_found. HTTP 429 останавливает запуск по `Retry-After` вместо продавливания лимита подписки; зависшие `processing` возвращаются в очередь по `--lease-seconds`.
+
+```bash
+python3 -m ai_advokat_parser --out /tmp/ai-advokat-sot sot-status --scan-id sot-2026-08
+python3 -m ai_advokat_parser --out /tmp/ai-advokat-sot sot-stubs --scan-id sot-2026-08 --output sot-stubs.json
+```
+
+`sot-stubs` без `--output` печатает JSON в stdout; заглушки недоступных решений не содержат cookie, токенов и учетных данных.
+
+### Railway: безопасный второй сервис
+
+Тот же образ и та же команда `python -m ai_advokat_parser.railway_worker`, но отдельный Railway-сервис. Сначала безопасный режим, который не обращается к источнику:
+
+```text
+AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot sot-status
+```
+
+После проверки логина и двухстраничного smoke-run команда полного прохода:
+
+```text
+AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot --delay 0 sot-scan --scan-id sot-2026-08 --retry-failed
+```
+
+Учетные данные и контракт источника задаются только в Variables и никогда не попадают в `AI_ADVOCAT_COMMAND`. Для Postgres добавь `DATABASE_URL` (или `AI_ADVOCAT_DATABASE_URL`): таблицы `sot_*` создадутся рядом с таблицами ZANGER, а рестарт контейнера продолжит скан с сохраненной страницы. Начинай с `--max-pages 2` и расширяй после проверки `sot-status`. Скан работает в пределах подписки: по умолчанию один worker и остановка по лимиту источника.
 
 ## Форматы
 

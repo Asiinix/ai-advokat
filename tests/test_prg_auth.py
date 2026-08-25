@@ -239,9 +239,12 @@ class AuthenticatedClientTest(unittest.TestCase):
         self.server.state.session_max_uses = 0
         client = self.make_client()
 
-        with self.assertRaises(SourceAuthError) as ctx:
+        # The login itself keeps working, so this is a verdict about the URL and
+        # not about the session: it must not be a fatal SourceAuthError.
+        with self.assertRaises(http_client.SourceAccessDeniedError) as ctx:
             client.get_json(f"{self.server.base_url}/mapi/api/Document/GetDocument/1/0")
 
+        self.assertNotIsInstance(ctx.exception, SourceAuthError)
         self.assertEqual(self.server.state.login_posts, 2)
         self.assertIn("re-authentication", str(ctx.exception))
 
