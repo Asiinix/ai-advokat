@@ -45,6 +45,7 @@ class ProxyConfig:
     header_timeout_seconds: int
     connect_timeout_seconds: int
     idle_timeout_seconds: int
+    max_tunnel_lifetime_seconds: int
 
     @classmethod
     def from_env(cls) -> "ProxyConfig":
@@ -65,6 +66,8 @@ class ProxyConfig:
             for host in allowed_hosts
         ):
             raise ValueError("EGRESS_PROXY_ALLOWED_HOSTS contains an invalid hostname")
+        if not allowed_hosts.issubset(DEFAULT_ALLOWED_HOSTS):
+            raise ValueError("EGRESS_PROXY_ALLOWED_HOSTS may only narrow the built-in PRG allowlist")
         return cls(
             listen_host="0.0.0.0",
             port=_bounded_int("PORT", 8080, 1, 65535),
@@ -78,6 +81,9 @@ class ProxyConfig:
             header_timeout_seconds=_bounded_int("EGRESS_PROXY_HEADER_TIMEOUT_SECONDS", 5, 1, 30),
             connect_timeout_seconds=_bounded_int("EGRESS_PROXY_CONNECT_TIMEOUT_SECONDS", 15, 1, 60),
             idle_timeout_seconds=_bounded_int("EGRESS_PROXY_IDLE_TIMEOUT_SECONDS", 120, 15, 900),
+            max_tunnel_lifetime_seconds=_bounded_int(
+                "EGRESS_PROXY_MAX_TUNNEL_LIFETIME_SECONDS", 3_600, 60, 86_400
+            ),
         )
 
 
@@ -100,6 +106,13 @@ class ConnectProxy:
         acquired = False
         tunnel_started = False
         try:
+            try:
+                await asyncio.wait_for(self._slots.acquire(), timeout=0.05)
+                acquired = True
+            except TimeoutError:
+                await self._respond(writer, 503, "Service Unavailable")
+                return
+
             request_line = await self._read_request_line(reader)
             if request_line is None:
                 await self._respond(writer, 431, "Request Header Fields Too Large")
@@ -118,13 +131,6 @@ class ConnectProxy:
             authority = self._allowed_authority(target)
             if authority is None:
                 await self._respond(writer, 403, "Forbidden")
-                return
-
-            try:
-                await asyncio.wait_for(self._slots.acquire(), timeout=0.05)
-                acquired = True
-            except TimeoutError:
-                await self._respond(writer, 503, "Service Unavailable")
                 return
 
             host, port = authority
@@ -203,10 +209,17 @@ class ConnectProxy:
             asyncio.create_task(self._relay(client_reader, upstream_writer)),
             asyncio.create_task(self._relay(upstream_reader, client_writer)),
         }
-        done, pending = await asyncio.wait(directions, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*done, *pending, return_exceptions=True)
+        group = asyncio.gather(*directions, return_exceptions=True)
+        try:
+            await asyncio.wait_for(
+                group,
+                timeout=self.config.max_tunnel_lifetime_seconds,
+            )
+        finally:
+            if not group.done():
+                group.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await group
 
     async def _relay(self, source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
         while True:
@@ -215,6 +228,10 @@ class ConnectProxy:
                 timeout=self.config.idle_timeout_seconds,
             )
             if not data:
+                if destination.can_write_eof():
+                    with contextlib.suppress(Exception):
+                        destination.write_eof()
+                        await destination.drain()
                 return
             destination.write(data)
             await destination.drain()

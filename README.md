@@ -333,7 +333,7 @@ Railway сам задает `PORT`; reference variable выше связывае
 `EGRESS_PROXY_HEADER_TIMEOUT_SECONDS=5`, `EGRESS_PROXY_CONNECT_TIMEOUT_SECONDS=15`
 и `EGRESS_PROXY_IDLE_TIMEOUT_SECONDS=120`. `EGRESS_PROXY_ALLOWED_HOSTS` можно
 сужать, но нельзя добавлять произвольные порты: production-сервис разрешает
-только HTTPS/443.
+только встроенные PRG-хосты по HTTPS/443.
 
 ### Живая проверка перед сканом (гейт валидации)
 

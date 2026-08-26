@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
+from unittest import mock
 
 from egress_proxy.server import ConnectProxy, ProxyConfig
 
@@ -29,6 +31,7 @@ class ConnectProxyTests(unittest.IsolatedAsyncioTestCase):
             header_timeout_seconds=2,
             connect_timeout_seconds=2,
             idle_timeout_seconds=2,
+            max_tunnel_lifetime_seconds=10,
         )
         self.proxy_server = await ConnectProxy(config).start()
         self.proxy_port = self.proxy_server.sockets[0].getsockname()[1]
@@ -75,6 +78,58 @@ class ConnectProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reader.readexactly(16), b"opaque-tls-bytes")
         writer.close()
         await writer.wait_closed()
+
+    async def test_client_half_close_does_not_truncate_the_response_tail(self) -> None:
+        async def reply_after_eof(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            body = await reader.read()
+            writer.write(b"tail:" + body)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        tail_server = await asyncio.start_server(reply_after_eof, "127.0.0.1", 0)
+        tail_port = tail_server.sockets[0].getsockname()[1]
+        config = ProxyConfig(
+            listen_host="127.0.0.1",
+            port=0,
+            allowed_hosts=frozenset({"127.0.0.1"}),
+            allowed_ports=frozenset({tail_port}),
+            max_connections=1,
+            max_header_bytes=4096,
+            header_timeout_seconds=2,
+            connect_timeout_seconds=2,
+            idle_timeout_seconds=2,
+            max_tunnel_lifetime_seconds=10,
+        )
+        proxy_server = await ConnectProxy(config).start()
+        proxy_port = proxy_server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+            writer.write(f"CONNECT 127.0.0.1:{tail_port} HTTP/1.0\r\n\r\n".encode("ascii"))
+            await writer.drain()
+            self.assertIn(b"200 Connection Established", await reader.readuntil(b"\r\n\r\n"))
+            writer.write(b"request")
+            await writer.drain()
+            writer.write_eof()
+            self.assertEqual(await reader.read(), b"tail:request")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            proxy_server.close()
+            tail_server.close()
+            await proxy_server.wait_closed()
+            await tail_server.wait_closed()
+
+    def test_environment_cannot_expand_the_prg_allowlist(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PORT": "8080", "EGRESS_PROXY_ALLOWED_HOSTS": "sb.prg.kz,example.com"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "only narrow"):
+                ProxyConfig.from_env()
 
 
 if __name__ == "__main__":
