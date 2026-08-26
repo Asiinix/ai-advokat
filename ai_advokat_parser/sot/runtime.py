@@ -15,7 +15,8 @@ from typing import Any, Mapping
 
 from ..config import SOT_PASSWORD_ENV, SOT_USERNAME_ENV
 from ..http_client import SourceAuthError, SourceRateLimitError
-from .adapter import MAX_WORKERS, SotSource, build_sot_client
+from .adapter import MAX_WORKERS, SotSource
+from .egress import SotEgressPool, build_sot_egress_client, partitions_from_env
 from .model import SotDiscoveryError
 from .source_config import SotConfigError, SotSourceConfig
 from .postgres_store import SotPostgresStore
@@ -70,7 +71,7 @@ def build_source(
     half-captured contract cannot create a scan row or take a lease.
     """
     config.validate()
-    client = build_sot_client(config, timeout=timeout, retries=retries, login_url=login_url)
+    client = build_sot_egress_client(config, timeout=timeout, retries=retries, login_url=login_url)
     return SotSource(client, config)
 
 
@@ -85,6 +86,23 @@ def credentials_state(env: Mapping[str, str] | None = None) -> str:
     return "missing"
 
 
+def egress_state(env: Mapping[str, str] | None = None) -> str:
+    """A safe one-line summary of the egress partitions: ids and variable names only."""
+    try:
+        partitions = partitions_from_env(env)
+    except SotConfigError as exc:
+        return f"ошибка конфигурации: {exc}"
+    rendered = []
+    for partition in partitions:
+        label = partition.partition_id
+        if partition.proxy_env:
+            label += f" (proxy_env={partition.proxy_env})"
+        if not partition.enabled:
+            label += " [выключена]"
+        rendered.append(label)
+    return ", ".join(rendered)
+
+
 def print_status(out_dir: str, scan_id: str | None = None, env: Mapping[str, str] | None = None) -> None:
     """Read-only report. Never contacts the source, never needs credentials."""
     config = load_config(env=env)
@@ -92,6 +110,7 @@ def print_status(out_dir: str, scan_id: str | None = None, env: Mapping[str, str
     print("PRG.SOT (судебные акты)")
     print(f"  origin: {config.base_url}")
     print(f"  учетные данные: {credentials_state(env)}")
+    print(f"  egress-партиции: {egress_state(env)}")
     print(f"  контракт источника: {'настроен' if not missing else 'не настроен'}")
     if missing:
         print("    не заданы: " + ", ".join(missing))
@@ -163,20 +182,29 @@ def probe_auth(
     config = load_config(env=env)
     print(f"[sot] origin: {config.base_url}")
     print(f"[sot] учетные данные: {credentials_state(env)}")
+    print(f"[sot] egress-партиции: {egress_state(env)}")
     missing = config.missing_requirements()
     if missing:
         print("[sot] контракт источника не настроен: " + ", ".join(missing))
 
-    client = build_sot_client(config, timeout=timeout, retries=retries, login_url=login_url)
+    client = build_sot_egress_client(config, timeout=timeout, retries=retries, login_url=login_url, env=env)
     if not client.uses_authentication:
         print(f"[sot] вход невозможен: задайте {SOT_USERNAME_ENV} и {SOT_PASSWORD_ENV}")
         return 2
     try:
         client.authenticate()
+    except SourceRateLimitError as exc:
+        # A throttled login is a quota verdict, not a credential failure: use
+        # the same exit code as a rate-limited page probe.
+        print(f"[sot] лимит источника при входе: {exc.rate_limit.describe()}")
+        return 3
     except SourceAuthError as exc:
         print(f"[sot] вход отклонен: {exc}")
         return 2
     print(f"[sot] вход выполнен, returnApp={client.auth.return_app}, returnUrl={client.auth.return_url}")
+    if isinstance(client, SotEgressPool):
+        for line in client.diagnostics():
+            print(f"[sot] egress {line}")
     assets = frontend_asset_paths(client, config.base_url)
     if assets:
         print("[sot] frontend assets (same-origin):")
@@ -243,6 +271,7 @@ __all__ = [
     "DECISION_FORMATS",
     "build_source",
     "credentials_state",
+    "egress_state",
     "frontend_asset_paths",
     "load_config",
     "open_store",

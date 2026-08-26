@@ -53,6 +53,7 @@ def build_sot_client(
     retries: int = 3,
     retry_delay: float = 1.5,
     login_url: str | None = None,
+    proxy_url: str | None = None,
 ) -> SourceClient:
     """A SourceClient bound to the PRG.SOT auth profile and its own cookie jar."""
     profile: AuthProfile = sot_auth_profile(login_url=login_url, return_url=f"{config.base_url}/")
@@ -64,6 +65,7 @@ def build_sot_client(
         # A shared subscription must never be pushed through its own quota, so a
         # 429 stops the worker with the source's own wait instead of retrying.
         raise_on_rate_limit=True,
+        proxy_url=proxy_url,
     )
 
 

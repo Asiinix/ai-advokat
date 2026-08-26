@@ -52,7 +52,23 @@ STUB_FIELDS = (
 )
 
 DETAIL_MAX_LEN = 300
-SECRET_MARKERS = ("cookie", "set-cookie", "__requestverificationtoken", "authorization", "password")
+SECRET_MARKERS = (
+    "cookie",
+    "set-cookie",
+    "__requestverificationtoken",
+    "authorization",
+    "proxy-authorization",
+    "password",
+)
+# Proxy URLs are resolved only from dedicated environment variables and may
+# embed credentials, so any variable whose name carries the PROXY token is
+# treated as secret-bearing. Token matching (not a suffix) is what covers the
+# documented AI_ADVOCAT_SOT_PROXY_PX1 style alongside HTTP_PROXY/http_proxy.
+PROXY_ENV_TOKEN = "PROXY"
+
+
+def _names_proxy_value(name: str) -> bool:
+    return PROXY_ENV_TOKEN in name.upper().split("_")
 
 
 class CatalogDiscoveryError(RuntimeError):
@@ -112,9 +128,15 @@ def sanitize_detail(message: str, env: dict[str, str] | None = None) -> str:
         return "source returned an HTML page (body omitted)"
     if any(marker in lowered for marker in SECRET_MARKERS):
         return "detail omitted: message referenced sensitive material"
-    for name in CREDENTIAL_ENV_NAMES:
-        value = (source.get(name) or "").strip()
-        if value and value in text:
+    for name, raw_value in source.items():
+        value = (raw_value or "").strip()
+        if not value or value not in text:
+            continue
+        if name in CREDENTIAL_ENV_NAMES:
+            text = text.replace(value, "***")
+        elif _names_proxy_value(name) and len(value) >= 8:
+            # NO_PROXY-style values can be trivial ("*", "localhost"); only a
+            # value long enough to be a URL is worth scrubbing as a secret.
             text = text.replace(value, "***")
     if len(text) > DETAIL_MAX_LEN:
         text = f"{text[:DETAIL_MAX_LEN]}…"

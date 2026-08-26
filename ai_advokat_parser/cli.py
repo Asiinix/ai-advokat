@@ -14,7 +14,7 @@ from .config import (
 )
 from .crawler import Crawler
 from .listing import DocumentRef, fetch_listing_page, load_document_refs_from_file
-from .http_client import SourceAuthError, SourceClient
+from .http_client import SourceAuthError, SourceClient, SourceRateLimitError
 from .sot import runtime as sot_runtime
 from .sot.scan import SotScanner
 from .sot.source_config import SotConfigError
@@ -767,5 +767,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         run_args(args)
-    except (SourceAuthError, SotConfigError, ValueError) as exc:
+    except (SourceAuthError, SourceRateLimitError, SotConfigError, ValueError) as exc:
+        # SourceRateLimitError covers a login throttled on every egress
+        # partition: exit cleanly with the source's own wait, no traceback.
         parser.error(str(exc))

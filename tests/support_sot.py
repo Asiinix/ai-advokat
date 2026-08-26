@@ -51,6 +51,9 @@ class FakeSotState:
         self.password = "sot-s3cret"
         self.form_action = "/account/login"
         self.reject_login = False
+        # When True the login page itself answers 429 with rate_limit_headers,
+        # the way a throttled SSO does before credentials are even posted.
+        self.login_rate_limited = False
         self.return_app_seen: list[str] = []
 
         self.decision_ids: list[str] = []
@@ -59,7 +62,9 @@ class FakeSotState:
         self.use_cursor = False
 
         self.search_hits: list[int] = []
+        self.search_sessions: list[str] = []
         self.decision_hits: list[str] = []
+        self.decision_sessions: list[str] = []
         self.login_gets = 0
         self.login_posts = 0
         self.sessions: dict[str, int] = {}
@@ -71,6 +76,9 @@ class FakeSotState:
         self.decisions: dict[str, dict] = {}
         # Number of remaining search requests before the source answers 429.
         self.search_rate_limit_after: int | None = None
+        # Sessions whose personal quota is spent: every request they make is a
+        # 429, while other sessions keep working (an egress-partition scenario).
+        self.rate_limited_sessions: set[str] = set()
         self.rate_limit_headers = {"Retry-After": "2", "X-RateLimit-Remaining": "0"}
         self.quota_headers = {"X-RateLimit-Remaining": "24999", "X-RateLimit-Limit": "25000"}
 
@@ -185,6 +193,11 @@ class FakeSotServer:
             def _send_login_page(self) -> None:
                 with state.lock:
                     state.login_gets += 1
+                    limited = state.login_rate_limited
+                if limited:
+                    headers = list(state.rate_limit_headers.items())
+                    self._send(429, json.dumps({"error": "rate limit"}), "application/json", headers)
+                    return
                 self._send(200, LOGIN_PAGE.format(action=state.form_action, token="sot-token"), "text/html")
 
             def _session(self) -> str | None:
@@ -215,8 +228,21 @@ class FakeSotServer:
                 else:
                     self._send(404, "not found", "text/plain")
 
+            def _rate_limited_session(self, session: str | None) -> bool:
+                with state.lock:
+                    limited = session is not None and session in state.rate_limited_sessions
+                if limited:
+                    headers = list(state.rate_limit_headers.items())
+                    self._send(429, json.dumps({"error": "rate limit"}), "application/json", headers)
+                return limited
+
             def _search(self, parsed) -> None:
+                session = self._session()
                 if not self._require_session():
+                    return
+                with state.lock:
+                    state.search_sessions.append(session or "")
+                if self._rate_limited_session(session):
                     return
                 with state.lock:
                     if state.search_rate_limit_after is not None:
@@ -247,10 +273,14 @@ class FakeSotServer:
                 self._send(200, json.dumps(body), "application/json", list(state.quota_headers.items()))
 
             def _decision(self, decision_id: str) -> None:
+                session = self._session()
                 if not self._require_session():
                     return
                 with state.lock:
                     state.decision_hits.append(decision_id)
+                    state.decision_sessions.append(session or "")
+                if self._rate_limited_session(session):
+                    return
                 forced = state.decision_status.get(decision_id)
                 if forced:
                     self._send(

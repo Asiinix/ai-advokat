@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import email.utils
 import datetime as dt
 import html
@@ -301,6 +302,33 @@ def parse_login_form(text: str, base_url: str) -> tuple[str, str]:
     return action_url, token
 
 
+class _ExplicitProxyHandler(urllib.request.ProxyHandler):
+    """A ProxyHandler that never consults the ambient NO_PROXY/no_proxy.
+
+    An egress partition's proxy is an explicit routing decision. The stock
+    handler asks urllib.request.proxy_bypass(), so a stray no_proxy='*' in the
+    container would silently turn the partition into a direct connection; this
+    override keeps the stock behaviour minus that environment check.
+    """
+
+    def proxy_open(self, req, proxy, type):
+        orig_type = req.type
+        proxy_type, user, password, hostport = urllib.request._parse_proxy(proxy)
+        if proxy_type is None:
+            proxy_type = orig_type
+        if user and password:
+            user_pass = f"{urllib.parse.unquote(user)}:{urllib.parse.unquote(password)}"
+            creds = base64.b64encode(user_pass.encode()).decode("ascii")
+            req.add_header("Proxy-authorization", "Basic " + creds)
+        req.set_proxy(urllib.parse.unquote(hostport), proxy_type)
+        if orig_type == proxy_type or orig_type == "https":
+            # Let the http/https handler carry the now-proxied request.
+            return None
+        # Match urllib's stock cross-protocol behavior; only the ambient
+        # proxy_bypass() early return is intentionally omitted above.
+        return self.parent.open(req, timeout=req.timeout)
+
+
 class SourceClient:
     def __init__(
         self,
@@ -312,6 +340,7 @@ class SourceClient:
         cookie_jar: CookieJar | None = None,
         auth: AuthProfile | None = None,
         raise_on_rate_limit: bool = False,
+        proxy_url: str | None = None,
     ) -> None:
         self.timeout = timeout
         self.retries = retries
@@ -321,6 +350,17 @@ class SourceClient:
         # what the legacy call sites and their module-level patches expect.
         self._auth = auth
         self.raise_on_rate_limit = raise_on_rate_limit
+        # None keeps the legacy default opener (which honours the ambient
+        # proxy environment); "" is an explicitly proxy-less (direct) egress
+        # partition; anything else is the exact proxy URL to use for both
+        # http and https targets. The URL lives only inside the opener handler
+        # and never appears in repr, logs or error messages.
+        if proxy_url is not None:
+            if proxy_url:
+                self._validate_proxy_url(proxy_url)
+            self._proxy_mode = "proxy" if proxy_url else "direct"
+        else:
+            self._proxy_mode = "ambient"
         self.credentials = credentials_from_env(profile=self.auth) if credentials is None else credentials
         # CookieJar guards its own storage with a lock, and the opener handlers
         # are stateless, so one jar/opener can be shared by all worker threads.
@@ -329,7 +369,17 @@ class SourceClient:
             strict_rfc2965_unverifiable=False,
         )
         self.cookie_jar = CookieJar(cookie_policy) if cookie_jar is None else cookie_jar
-        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookie_jar))
+        handlers: list[Any] = []
+        if proxy_url is not None:
+            # A configured partition uses exactly its own proxy URL, immune to
+            # the ambient NO_PROXY/no_proxy; a direct partition explicitly
+            # disables the ambient http_proxy/https_proxy.
+            if proxy_url:
+                handlers.append(_ExplicitProxyHandler({"http": proxy_url, "https": proxy_url}))
+            else:
+                handlers.append(urllib.request.ProxyHandler({}))
+        handlers.append(urllib.request.HTTPCookieProcessor(self.cookie_jar))
+        self._opener = urllib.request.build_opener(*handlers)
         self._auth_lock = threading.Lock()
         self._auth_generation = 0
         self._login_failure: tuple[str, int | None] | None = None
@@ -344,6 +394,10 @@ class SourceClient:
     @property
     def uses_authentication(self) -> bool:
         return self.credentials is not None
+
+    @property
+    def uses_proxy(self) -> bool:
+        return self._proxy_mode == "proxy"
 
     @property
     def authenticated(self) -> bool:
@@ -598,7 +652,20 @@ class SourceClient:
         try:
             return self._open(request)
         except urllib.error.HTTPError as exc:
+            login_headers = dict(exc.headers.items()) if exc.headers else {}
             exc.read()
+            if exc.code in RATE_LIMIT_STATUSES and self.raise_on_rate_limit:
+                # A throttled login is a quota verdict, not a credential one: it
+                # must not be cached as a login failure and it must carry the
+                # source's own wait so a pool can rest just this session.
+                rate_limit = parse_rate_limit(login_headers)
+                self._last_rate_limit = rate_limit
+                raise SourceRateLimitError(
+                    self.auth.login_url,
+                    f"PRG {stage} hit the source rate limit (HTTP {exc.code}): {rate_limit.describe()}.",
+                    rate_limit,
+                    status=exc.code,
+                ) from exc
             raise SourceAuthError(
                 self.auth.login_url,
                 f"PRG {stage} failed with HTTP {exc.code}.",
@@ -657,3 +724,26 @@ class SourceClient:
             "The source returned a login page and the PRG session could not be established.",
             status=status,
         )
+
+    @staticmethod
+    def _validate_proxy_url(proxy_url: str) -> None:
+        # The value may embed proxy credentials, so the error names the rule,
+        # never the value.
+        parsed = urllib.parse.urlsplit(proxy_url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("proxy_url must be an absolute http(s) URL")
+
+    def __repr__(self) -> str:
+        # The default repr would leak the opener (and with it a proxy URL with
+        # embedded credentials) and the cookie jar, so keep it safe on purpose.
+        generation = getattr(self, "_auth_generation", 0)
+        state = (
+            "authenticated"
+            if generation > 0
+            else "anonymous"
+            if self.credentials is None
+            else "unauthenticated"
+        )
+        profile = getattr(self, "_auth", None)
+        name = profile.name if profile is not None else default_auth_profile().name
+        return f"SourceClient(auth='{name}', state='{state}', proxy='{getattr(self, '_proxy_mode', 'ambient')}')"
