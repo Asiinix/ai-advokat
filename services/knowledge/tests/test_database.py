@@ -111,6 +111,7 @@ LEGAL_METHODS = [
     ("requeue_failed", ()),
     ("claim_jobs", ("worker", 5)),
     ("load_document", ("123",)),
+    ("document_output_formats", ("123",)),
     ("mark_indexed", ("123", 3)),
     ("mark_failed", ("123", "boom")),
     ("job_stats", ()),
@@ -123,6 +124,7 @@ JUDICIAL_METHODS = [
     ("requeue_sot_failed", ()),
     ("claim_sot_jobs", ("worker", 5)),
     ("load_sot_decision", ("prg_sot:9",)),
+    ("sot_output_formats", ("prg_sot:9",)),
     ("mark_sot_indexed", ("prg_sot:9", 3)),
     ("mark_sot_failed", ("prg_sot:9", "boom")),
     ("sot_job_stats", ()),
@@ -237,3 +239,24 @@ def test_load_sot_decision_merges_columns_into_empty_metadata():
 
     assert payload.metadata == {"case_number": "2-1/2026", "court": "Суд", "decision_date": "2026-03-14"}
     assert payload.parties is None
+
+
+def test_output_format_queries_stay_inside_their_corpus():
+    legal_cursor = FakeCursor()
+    legal_cursor.fetchall_results = [[("html",), ("txt",)]]
+    legal_patcher = patch_database(legal_cursor)
+    try:
+        legal = KnowledgeDatabase("postgresql://x").document_output_formats("123")
+    finally:
+        legal_patcher.stop()
+
+    sot_cursor = FakeCursor()
+    sot_cursor.fetchall_results = [[("json",), ("txt",)]]
+    sot_patcher = patch_database(sot_cursor)
+    try:
+        judicial = KnowledgeDatabase("postgresql://x").sot_output_formats("prg_sot:9")
+    finally:
+        sot_patcher.stop()
+
+    assert legal == ["html", "txt"]
+    assert judicial == ["json", "txt"]

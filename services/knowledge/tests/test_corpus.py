@@ -23,6 +23,7 @@ from knowledge_service.corpus import (
     merge_ranked_results,
     normalize_corpus,
     provenance_for_corpus,
+    renderable_formats,
     sot_chunk_id,
 )
 
@@ -56,6 +57,12 @@ def test_corpus_filters_map_to_exactly_the_right_indices():
 
 def test_default_index_names_are_distinct():
     assert DEFAULT_LEGAL_INDEX != DEFAULT_SOT_INDEX
+
+
+def test_txt_enables_consistent_html_and_pdf_views_without_storing_them():
+    assert renderable_formats(["json", "txt"]) == ["html", "pdf", "txt", "json"]
+    assert renderable_formats(["html", "txt", "pdf"]) == ["html", "pdf", "txt"]
+    assert renderable_formats(["json"]) == ["json"]
 
 
 def test_chunk_ids_cannot_collide_across_corpora():
@@ -114,6 +121,7 @@ def test_every_result_carries_source_system_and_corpus_type():
                 "proceeding_type": "гражданское",
                 "decision_date": "2026-03-14",
                 "parties": [{"role": "истец", "name": "ТОО Альфа"}],
+                "metadata": {"document_count": 3},
             },
         },
         CORPUS_JUDICIAL_DECISION,
@@ -124,6 +132,7 @@ def test_every_result_carries_source_system_and_corpus_type():
     assert judicial["case_number"] == "2-9/2026"
     assert judicial["court"] == "Межрайонный суд"
     assert judicial["parties"][0]["name"] == "ТОО Альфа"
+    assert judicial["document_count"] == 3
 
 
 def _result(corpus: str, doc_id: str, score: float) -> dict:

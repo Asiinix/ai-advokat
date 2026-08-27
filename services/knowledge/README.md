@@ -89,7 +89,8 @@ Header: Authorization: Bearer <MCP_API_KEY>
 - `source_system` — `prg_zanger` или `prg_sot`;
 - `corpus_type` — `legal_act` или `judicial_decision`;
 - для судебных решений дополнительно `decision_id`, `case_number`, `court`,
-  `judge`, `region`, `instance`, `proceeding_type`, `decision_date`, `parties`;
+  `judge`, `region`, `instance`, `proceeding_type`, `decision_date`, `parties`
+  и `document_count`, когда источник сообщил число документов в деле;
 - для legal-документов — `pages`.
 
 Ответ также содержит `corpus` (итоговый фильтр) и `sources` (сколько
@@ -97,7 +98,10 @@ Header: Authorization: Bearer <MCP_API_KEY>
 
 `get_document(doc_id)` читает исходный текст частями: legal-документы — по
 обычному `doc_id`, судебные решения — по ключу из результатов поиска
-(`prg_sot:...`). Оба ответа несут `source_system` и `corpus_type`.
+(`prg_sot:...`). Оба ответа несут `source_system`, `corpus_type`, физические
+`stored_formats` и доступные пользователю `available_formats`. HTML и PDF могут
+формироваться web-сервисом по запросу из TXT без хранения миллионов бинарных
+копий; судебный ответ также возвращает `document_count`.
 
 `get_related_documents(doc_id)` работает с графом ссылок legal-корпуса; для
 ключа `prg_sot:` возвращает пустой `related` с провенансом и

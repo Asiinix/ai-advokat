@@ -18,6 +18,7 @@ from .corpus import (
     indices_for_corpus,
     merge_ranked_results,
     normalize_corpus,
+    renderable_formats,
 )
 from .database import KnowledgeDatabase
 from .elasticsearch import ElasticsearchStore
@@ -113,6 +114,7 @@ def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[s
                 "corpus_type": CORPUS_JUDICIAL_DECISION,
             }
         end = min(len(decision.text), safe_offset + safe_limit)
+        stored_formats = database.sot_output_formats(key)
         return {
             "found": True,
             "doc_id": decision.decision_key,
@@ -129,6 +131,9 @@ def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[s
             "proceeding_type": decision.proceeding_type,
             "decision_date": decision.decision_date,
             "parties": decision.parties,
+            "document_count": decision.metadata.get("document_count"),
+            "stored_formats": stored_formats,
+            "available_formats": renderable_formats(stored_formats),
             "offset": safe_offset,
             "next_offset": end if end < len(decision.text) else None,
             "total_chars": len(decision.text),
@@ -145,6 +150,7 @@ def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[s
             "corpus_type": CORPUS_LEGAL_ACT,
         }
     end = min(len(document.text), safe_offset + safe_limit)
+    stored_formats = database.document_output_formats(key)
     return {
         "found": True,
         "doc_id": document.doc_id,
@@ -154,6 +160,8 @@ def get_document(doc_id: str, offset: int = 0, max_chars: int = 20000) -> dict[s
         "source_system": SOURCE_SYSTEM_LEGAL,
         "corpus_type": CORPUS_LEGAL_ACT,
         "pages": document.pages,
+        "stored_formats": stored_formats,
+        "available_formats": renderable_formats(stored_formats),
         "offset": safe_offset,
         "next_offset": end if end < len(document.text) else None,
         "total_chars": len(document.text),

@@ -160,6 +160,11 @@ def build_result(hit: Mapping[str, Any], corpus: str, excerpt_chars: int = 900) 
     if corpus == CORPUS_JUDICIAL_DECISION:
         for name in JUDICIAL_RESULT_FIELDS:
             result[name] = source.get(name, "")
+        metadata = source.get("metadata")
+        if isinstance(metadata, Mapping):
+            raw_count = metadata.get("document_count")
+            if isinstance(raw_count, int) and raw_count >= 0:
+                result["document_count"] = raw_count
     else:
         result["pages"] = source.get("pages")
     return result
@@ -171,6 +176,17 @@ def default_source_url(doc_id: str, corpus: str) -> str:
     if not doc_id:
         return ""
     return LEGAL_SOURCE_URL_TEMPLATE.format(doc_id=doc_id)
+
+
+def renderable_formats(stored_formats: Iterable[str]) -> list[str]:
+    """Views the web layer can provide without persisting generated binaries."""
+    result = list(dict.fromkeys(str(item) for item in stored_formats))
+    if "txt" in result:
+        for generated in ("html", "pdf"):
+            if generated not in result:
+                result.append(generated)
+    order = {name: index for index, name in enumerate(("html", "pdf", "txt", "json", "meta"))}
+    return sorted(result, key=lambda name: (order.get(name, 100), name))
 
 
 def merge_ranked_results(

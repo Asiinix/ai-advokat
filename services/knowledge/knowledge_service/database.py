@@ -286,6 +286,14 @@ class KnowledgeDatabase:
             source_sha256=str(row[7]),
         )
 
+    def document_output_formats(self, doc_id: str) -> list[str]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT format FROM document_outputs WHERE doc_id = %s ORDER BY format",
+                (doc_id,),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
+
     def mark_indexed(self, doc_id: str, chunks_indexed: int) -> None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -538,6 +546,14 @@ class KnowledgeDatabase:
             decision_date=str(row[10] or ""),
             parties=parties,
         )
+
+    def sot_output_formats(self, decision_key: str) -> list[str]:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT format FROM sot_decision_outputs WHERE decision_key = %s ORDER BY format",
+                (decision_key,),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
 
     def mark_sot_indexed(self, decision_key: str, chunks_indexed: int) -> None:
         with self.connect() as conn, conn.cursor() as cur:
