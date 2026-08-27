@@ -370,10 +370,33 @@ AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot sot-status
 После проверки логина и двухстраничного smoke-run команда полного прохода:
 
 ```text
-AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot --delay 0 sot-scan --scan-id sot-2026-08 --retry-failed
+AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot --formats txt,json --delay 0 sot-scan --scan-id prg-sot-all-with-documents-v1
 ```
 
 Учетные данные и контракт источника задаются только в Variables и никогда не попадают в `AI_ADVOCAT_COMMAND`. Для Postgres добавь `DATABASE_URL` (или `AI_ADVOCAT_DATABASE_URL`): таблицы `sot_*` создадутся рядом с таблицами ZANGER, а рестарт контейнера продолжит скан с сохраненной страницы. Начинай с `--max-pages 2` и расширяй после проверки `sot-status`. Скан работает в пределах подписки: по умолчанию один worker и остановка по лимиту источника.
+
+Для production включается opt-in supervisor. Он повторяет только `sot-scan` с тем
+же `--scan-id`, после `rate_limited` ждет максимальный `retry-after`/`reset-in`
+источника плюс safety buffer, а после обычной recoverable-паузы использует
+короткий backoff. `completed` больше не запускается; `aborted`, ошибка входа или
+контракта паркуют контейнер с явной ошибкой в логах, чтобы Railway restart policy
+не стучался в PRG по кругу.
+
+```text
+AI_ADVOCAT_SOT_AUTO_RESUME=true
+AI_ADVOCAT_SOT_AUTO_RESUME_SAFETY_SECONDS=30
+AI_ADVOCAT_SOT_AUTO_RESUME_PAUSED_SECONDS=300
+AI_ADVOCAT_SOT_AUTO_RESUME_FALLBACK_SECONDS=3600
+AI_ADVOCAT_SOT_AUTO_RESUME_MAX_WAIT_SECONDS=691200
+```
+
+`FALLBACK_SECONDS` применяется только когда источник не прислал время reset;
+`MAX_WAIT_SECONDS` ограничивает одну паузу (по умолчанию восемь суток), но не
+сокращает и не отменяет квоту — ранний ответ 429 снова поставит scan на ожидание.
+Первичный многомесячный проход запускается без `--retry-failed`, иначе каждое
+недельное возобновление зря вернуло бы в очередь все недоступные карточки. После
+фазы `completed` сделай один отдельный запуск с тем же `--scan-id` и
+`--retry-failed`, затем выгрузи итоговые заглушки через `sot-stubs`.
 
 ## Форматы
 
