@@ -6,3 +6,4 @@ dockerfilePath = "Dockerfile"
 healthcheckPath = "/healthz"
 healthcheckTimeout = 30
 restartPolicyType = "ALWAYS"
+sleepApplication = false

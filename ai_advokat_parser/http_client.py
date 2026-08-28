@@ -86,6 +86,15 @@ class SourceAuthError(SourceRequestError):
     """
 
 
+class SourceAuthNetworkError(SourceAuthError):
+    """Raised when PRG login failed before an authentication verdict.
+
+    This is deliberately a ``SourceAuthError`` for backwards compatibility,
+    but SOT's durable scanner can distinguish a transient transport outage
+    from rejected credentials and pause for an automatic retry.
+    """
+
+
 class SourceAccessDeniedError(SourceRequestError):
     """Raised when a document stays login-walled for an authenticated session.
 
@@ -672,7 +681,10 @@ class SourceClient:
                 status=exc.code,
             ) from exc
         except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-            raise SourceAuthError(self.auth.login_url, f"PRG {stage} failed with a network error.") from exc
+            raise SourceAuthNetworkError(
+                self.auth.login_url,
+                f"PRG {stage} failed with a network error.",
+            ) from exc
 
     def _has_cookie_for(self, url: str) -> bool:
         host = (urllib.parse.urlparse(url).hostname or "").lower()

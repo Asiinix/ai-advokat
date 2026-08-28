@@ -25,7 +25,12 @@ from ai_advokat_parser.config import (
     SOT_PASSWORD_ENV,
     SOT_USERNAME_ENV,
 )
-from ai_advokat_parser.http_client import SourceAuthError, SourceRateLimitError, RateLimitInfo
+from ai_advokat_parser.http_client import (
+    RateLimitInfo,
+    SourceAuthError,
+    SourceAuthNetworkError,
+    SourceRateLimitError,
+)
 from ai_advokat_parser.sot import CORPUS_TYPE, SOURCE_SYSTEM, decision_key
 from ai_advokat_parser.sot.adapter import SotSource, build_sot_client
 from ai_advokat_parser.sot.model import (
@@ -548,6 +553,48 @@ class SotStubTest(SotScanBase):
 
 
 class SotFatalErrorTest(SotScanBase):
+    def test_login_network_error_during_enumeration_pauses_and_resumes(self) -> None:
+        decision_ids = self.load(count=2, page_size=2)
+        scanner = self.make_scanner()
+        error = SourceAuthNetworkError(
+            "https://sb.prg.kz/api",
+            "PRG login page request failed with a network error.",
+        )
+
+        with mock.patch.object(SotSource, "fetch_search_page", side_effect=error):
+            state = self.run_scan(scanner)
+
+        self.assertEqual(state.phase, PHASE_PAUSED)
+        self.assertIn("transient network", state.error or "")
+        self.assertEqual(self.store.scan_stats("sot-1"), {})
+
+        state = self.run_scan(scanner)
+        self.assertEqual(state.phase, PHASE_COMPLETED)
+        for item in decision_ids:
+            self.assertEqual(self.store.decision_status(decision_key(item)), STATUS_EXPORTED)
+
+    def test_login_network_error_during_drain_pauses_and_requeues(self) -> None:
+        decision_ids = self.load(count=2, page_size=2)
+        scanner = self.make_scanner()
+        error = SourceAuthNetworkError(
+            "https://sb.prg.kz/api",
+            "PRG login page request failed with a network error.",
+        )
+
+        with mock.patch.object(SotSource, "fetch_decision", side_effect=error):
+            state = self.run_scan(scanner)
+
+        self.assertEqual(state.phase, PHASE_PAUSED)
+        self.assertIn("transient network", state.error or "")
+        statuses = {self.store.decision_status(decision_key(item)) for item in decision_ids}
+        self.assertEqual(statuses, {STATUS_QUEUED})
+        self.assertEqual(self.store.scan_stubs("sot-1"), [])
+
+        state = self.run_scan(scanner)
+        self.assertEqual(state.phase, PHASE_COMPLETED)
+        for item in decision_ids:
+            self.assertEqual(self.store.decision_status(decision_key(item)), STATUS_EXPORTED)
+
     def test_auth_error_aborts_and_hands_the_decision_back(self) -> None:
         decision_ids = self.load(count=2, page_size=2)
         scanner = self.make_scanner()

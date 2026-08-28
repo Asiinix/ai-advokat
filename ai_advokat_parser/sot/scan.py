@@ -15,7 +15,7 @@ import threading
 import time
 
 from ..catalog import sanitize_detail
-from ..http_client import SourceAuthError, SourceRateLimitError
+from ..http_client import SourceAuthError, SourceAuthNetworkError, SourceRateLimitError
 from .adapter import MAX_WORKERS, SotSource
 from .model import (
     OUTCOME_DONE,
@@ -106,6 +106,7 @@ class SotScanner:
         self.store.set_scan_phase(scan_id, PHASE_ENUMERATING)
         enumeration_error: str | None = None
         enumeration_complete = False
+        transient_network_error = False
         try:
             enumeration_complete = self._enumerate(
                 scan_id,
@@ -114,6 +115,13 @@ class SotScanner:
                 max_decisions,
                 lease_seconds=lease_seconds,
                 poll_interval=poll_interval,
+            )
+        except SourceAuthNetworkError as exc:
+            transient_network_error = True
+            enumeration_error = sanitize_detail(f"transient network: {exc}")
+            print(
+                f"[sot] {scan_id}: временный сетевой сбой авторизации; "
+                "скан будет автоматически продолжен"
             )
         except SourceAuthError as exc:
             self._abort(scan_id, exc)
@@ -133,10 +141,17 @@ class SotScanner:
         self.store.set_scan_phase(
             scan_id, PHASE_DRAINING, error=enumeration_error, rate_limit_note=self._rate_limit_note
         )
-        if self._rate_limit_note is None:
+        if self._rate_limit_note is None and not transient_network_error:
             try:
                 self._processed_this_run += self._drain(
                     scan_id, lease_seconds=lease_seconds, poll_interval=poll_interval
+                )
+            except SourceAuthNetworkError as exc:
+                transient_network_error = True
+                enumeration_error = sanitize_detail(f"transient network: {exc}")
+                print(
+                    f"[sot] {scan_id}: временный сетевой сбой авторизации при выгрузке; "
+                    "скан будет автоматически продолжен"
                 )
             except SourceAuthError as exc:
                 self._abort(scan_id, exc)
