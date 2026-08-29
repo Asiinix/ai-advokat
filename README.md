@@ -384,13 +384,15 @@ AI_ADVOCAT_COMMAND=--out /tmp/ai-advokat-sot --formats txt,json --delay 0 sot-sc
 также ждет и повторяет запуск вместо фатального `exit 2`. После обычной
 recoverable-паузы используется короткий backoff. `completed` больше не
 запускается; `aborted`, отклоненные учетные данные или ошибка контракта паркуют
-контейнер с явной ошибкой в логах, чтобы Railway restart policy не стучался в
-PRG по кругу.
+завершают процесс с ненулевым кодом, чтобы Railway показал инцидент и применил ограниченную
+`ON_FAILURE` restart policy. Временный обрыв Postgres повторяет всю идемпотентную
+команду с новым соединением и не сбрасывает сохраненную страницу.
 
 ```text
 AI_ADVOCAT_SOT_AUTO_RESUME=true
 AI_ADVOCAT_SOT_AUTO_RESUME_SAFETY_SECONDS=30
 AI_ADVOCAT_SOT_AUTO_RESUME_PAUSED_SECONDS=300
+AI_ADVOCAT_SOT_AUTO_RESUME_DATABASE_SECONDS=30
 AI_ADVOCAT_SOT_AUTO_RESUME_FALLBACK_SECONDS=3600
 AI_ADVOCAT_SOT_AUTO_RESUME_MAX_WAIT_SECONDS=691200
 ```

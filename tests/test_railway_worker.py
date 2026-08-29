@@ -22,6 +22,30 @@ from ai_advokat_parser.sot.model import (
 COMMAND = "--out /tmp/sot --delay 0 sot-scan --scan-id all-sot-v1"
 
 
+class Error(Exception):
+    __module__ = "psycopg"
+
+
+class OperationalError(Error):
+    __module__ = "psycopg"
+
+    def __init__(self, message: str, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class InterfaceError(Exception):
+    __module__ = "psycopg"
+
+
+class InvalidPassword(OperationalError):
+    __module__ = "psycopg.errors"
+
+
+class InvalidCatalogName(OperationalError):
+    __module__ = "psycopg.errors"
+
+
 def state(phase: str, note: str | None = None):
     return SimpleNamespace(phase=phase, rate_limit_note=note)
 
@@ -263,6 +287,289 @@ class RailwaySotSupervisorTests(unittest.TestCase):
 
         runner.assert_called_once()
         sleeper.assert_not_called()
+
+    def test_transient_database_disconnect_reruns_with_a_fresh_store(self) -> None:
+        runner = mock.Mock(
+            side_effect=[OperationalError("the connection is closed", "08006"), None]
+        )
+        state_loader = mock.Mock(return_value=state(PHASE_COMPLETED))
+        sleeper = mock.Mock()
+
+        result = railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "12"},
+            runner=runner,
+            state_loader=state_loader,
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(result.phase, PHASE_COMPLETED)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(state_loader.call_count, 2)
+        sleeper.assert_called_once_with(12.0)
+
+    def test_transport_operational_error_without_sqlstate_is_recoverable(self) -> None:
+        runner = mock.Mock(side_effect=[OperationalError("SSL unexpected EOF"), None])
+        sleeper = mock.Mock()
+
+        railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "7"},
+            runner=runner,
+            state_loader=lambda *_: state(PHASE_COMPLETED),
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(runner.call_count, 2)
+        sleeper.assert_called_once_with(7.0)
+
+    def test_unknown_operational_error_without_transport_marker_is_fatal(self) -> None:
+        runner = mock.Mock(side_effect=OperationalError("invalid connection option"))
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "invalid connection option"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        runner.assert_called_once()
+        sleeper.assert_not_called()
+
+    def test_generic_connection_failure_with_bad_password_is_fatal(self) -> None:
+        runner = mock.Mock(
+            side_effect=OperationalError(
+                'connection failed: FATAL: password authentication failed for user "parser"'
+            )
+        )
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "password authentication failed"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        runner.assert_called_once()
+        sleeper.assert_not_called()
+
+    def test_generic_connection_failure_with_missing_database_is_fatal(self) -> None:
+        runner = mock.Mock(
+            side_effect=OperationalError(
+                'connection failed: FATAL: database "missing" does not exist'
+            )
+        )
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "does not exist"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        runner.assert_called_once()
+        sleeper.assert_not_called()
+
+    def test_ambiguous_connection_failure_without_transport_evidence_is_fatal(self) -> None:
+        runner = mock.Mock(
+            side_effect=OperationalError(
+                'connection failed: invalid integer value "oops" for connection option "connect_timeout"'
+            )
+        )
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "invalid integer value"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        runner.assert_called_once()
+        sleeper.assert_not_called()
+
+    def test_closed_interface_connection_is_recoverable(self) -> None:
+        runner = mock.Mock(side_effect=[InterfaceError("the connection is closed"), None])
+        sleeper = mock.Mock()
+
+        railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "9"},
+            runner=runner,
+            state_loader=lambda *_: state(PHASE_COMPLETED),
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(runner.call_count, 2)
+        sleeper.assert_called_once_with(9.0)
+
+    def test_state_loader_database_disconnect_reruns_the_cli(self) -> None:
+        runner = mock.Mock()
+        state_loader = mock.Mock(
+            side_effect=[OperationalError("server closed the connection", "57P01"), state(PHASE_COMPLETED)]
+        )
+        sleeper = mock.Mock()
+
+        result = railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "11"},
+            runner=runner,
+            state_loader=state_loader,
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(result.phase, PHASE_COMPLETED)
+        runner.assert_called_once()
+        self.assertEqual(state_loader.call_count, 2)
+        sleeper.assert_called_once_with(11.0)
+
+    def test_database_outage_does_not_repeat_source_runs_until_storage_recovers(self) -> None:
+        runner = mock.Mock(
+            side_effect=[OperationalError("the connection is closed", "08006"), None]
+        )
+        state_loader = mock.Mock(
+            side_effect=[
+                OperationalError("connection refused", "08001"),
+                OperationalError("connection refused", "08001"),
+                state(PHASE_PAUSED),
+                state(PHASE_COMPLETED),
+            ]
+        )
+        sleeper = mock.Mock()
+
+        result = railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "6"},
+            runner=runner,
+            state_loader=state_loader,
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(result.phase, PHASE_COMPLETED)
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(state_loader.call_count, 4)
+        self.assertEqual(sleeper.call_args_list, [mock.call(6.0), mock.call(6.0), mock.call(6.0)])
+
+    def test_invalid_database_password_is_fatal(self) -> None:
+        runner = mock.Mock(side_effect=InvalidPassword("bad credentials", "28P01"))
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "InvalidPassword"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        runner.assert_called_once()
+        sleeper.assert_not_called()
+
+    def test_invalid_database_name_is_fatal_even_without_a_specialized_message(self) -> None:
+        runner = mock.Mock(side_effect=InvalidCatalogName("missing database", "3D000"))
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "InvalidCatalogName"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        sleeper.assert_not_called()
+
+    def test_wrapped_database_disconnect_is_recovered_from_its_cause(self) -> None:
+        database_error = OperationalError("SSL unexpected EOF", "08006")
+        wrapped = RuntimeError("scanner cleanup failed")
+        wrapped.__cause__ = database_error
+        runner = mock.Mock(side_effect=[wrapped, None])
+        sleeper = mock.Mock()
+
+        railway_worker.supervise_sot_scan(
+            COMMAND,
+            env={railway_worker.AUTO_RESUME_DATABASE_ENV: "8"},
+            runner=runner,
+            state_loader=lambda *_: state(PHASE_COMPLETED),
+            sleeper=sleeper,
+        )
+
+        self.assertEqual(runner.call_count, 2)
+        sleeper.assert_called_once_with(8.0)
+
+    def test_non_connection_interface_error_is_fatal(self) -> None:
+        runner = mock.Mock(side_effect=InterfaceError("bad cursor usage"))
+        sleeper = mock.Mock()
+
+        with self.assertRaisesRegex(railway_worker.AutoResumeFatalError, "bad cursor usage"):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={},
+                runner=runner,
+                state_loader=mock.Mock(),
+                sleeper=sleeper,
+            )
+
+        sleeper.assert_not_called()
+
+    def test_auto_resume_fatal_error_exits_nonzero_instead_of_parking_green(self) -> None:
+        with (
+            mock.patch.dict(
+                railway_worker.os.environ,
+                {
+                    "AI_ADVOCAT_COMMAND": COMMAND,
+                    railway_worker.AUTO_RESUME_ENV: "true",
+                    "AI_ADVOCAT_EXIT_AFTER_RUN": "false",
+                },
+                clear=True,
+            ),
+            mock.patch.object(
+                railway_worker,
+                "supervise_sot_scan",
+                side_effect=railway_worker.AutoResumeFatalError("broken"),
+            ),
+            mock.patch.object(railway_worker, "sleep_forever") as sleep_forever,
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                railway_worker.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        sleep_forever.assert_not_called()
+
+    def test_database_retry_delay_is_validated_before_the_first_run(self) -> None:
+        runner = mock.Mock()
+
+        with self.assertRaises(railway_worker.AutoResumeConfigError):
+            railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={railway_worker.AUTO_RESUME_DATABASE_ENV: "not-a-number"},
+                runner=runner,
+            )
+
+        runner.assert_not_called()
+
+    def test_database_url_is_redacted_if_a_fatal_error_contains_it(self) -> None:
+        database_url = "postgresql://user:very-secret@postgres.internal/db"
+        rendered = railway_worker.redact_secrets(
+            f"cannot connect to {database_url}",
+            {"DATABASE_URL": database_url},
+        )
+
+        self.assertNotIn("very-secret", rendered)
+        self.assertEqual(rendered, "cannot connect to ***")
 
     def test_aborted_scan_stops_without_sleeping_or_rerunning(self) -> None:
         runner = mock.Mock()

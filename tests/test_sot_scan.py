@@ -40,6 +40,8 @@ from ai_advokat_parser.sot.model import (
     OUTCOME_PENDING,
     PHASE_ABORTED,
     PHASE_COMPLETED,
+    PHASE_DRAINING,
+    PHASE_ENUMERATING,
     PHASE_PAUSED,
     PHASE_RATE_LIMITED,
     STATUS_EXPORTED,
@@ -81,6 +83,22 @@ STORE_METHODS = (
     "scan_stubs",
     "close",
 )
+
+
+class Error(Exception):
+    __module__ = "psycopg"
+
+
+class OperationalError(Error):
+    __module__ = "psycopg"
+
+    def __init__(self, message: str, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
+
+class ProgrammingError(Error):
+    __module__ = "psycopg"
 
 
 def clean_env(**overrides: str) -> dict[str, str]:
@@ -553,6 +571,98 @@ class SotStubTest(SotScanBase):
 
 
 class SotFatalErrorTest(SotScanBase):
+    def test_database_failure_during_enumeration_is_not_recorded_as_a_source_pause(self) -> None:
+        self.load(count=2, page_size=2)
+        scanner = self.make_scanner()
+        error = OperationalError("the connection is closed", "08006")
+
+        with (
+            mock.patch.object(self.store, "record_search_page", side_effect=error),
+            mock.patch.object(self.store, "set_scan_phase", wraps=self.store.set_scan_phase) as set_phase,
+        ):
+            with self.assertRaises(OperationalError):
+                self.run_scan(scanner)
+
+        phases = [call.args[1] for call in set_phase.call_args_list]
+        self.assertEqual(phases, [PHASE_ENUMERATING])
+        self.assertNotIn(PHASE_DRAINING, phases)
+        self.assertNotIn(PHASE_PAUSED, phases)
+
+    def test_database_failure_while_saving_is_not_a_failed_decision(self) -> None:
+        decision_ids = self.load(count=1, page_size=1)
+        scanner = self.make_scanner()
+        error = OperationalError("SSL unexpected EOF", "08006")
+
+        with (
+            mock.patch.object(self.store, "save_decision", side_effect=error),
+            mock.patch.object(
+                self.store,
+                "mark_decision_failed",
+                wraps=self.store.mark_decision_failed,
+            ) as mark_failed,
+        ):
+            with self.assertRaises(OperationalError):
+                self.run_scan(scanner)
+
+        mark_failed.assert_not_called()
+        self.assertEqual(
+            self.store.decision_status(decision_key(decision_ids[0])),
+            STATUS_PROCESSING,
+        )
+
+        with self.store._conn as conn:
+            conn.execute(
+                "UPDATE sot_decisions SET locked_at = ? WHERE decision_key = ?",
+                ("2000-01-01T00:00:00+00:00", decision_key(decision_ids[0])),
+            )
+        state = self.run_scan(self.make_scanner(), lease_seconds=0)
+        self.assertEqual(state.phase, PHASE_COMPLETED)
+        self.assertEqual(self.store.scan_stats("sot-1"), {OUTCOME_DONE: 1})
+
+    def test_permanent_database_failure_while_saving_is_not_a_failed_decision(self) -> None:
+        decision_ids = self.load(count=1, page_size=1)
+        scanner = self.make_scanner()
+        error = ProgrammingError("column judicial_decision is missing")
+
+        with (
+            mock.patch.object(self.store, "save_decision", side_effect=error),
+            mock.patch.object(
+                self.store,
+                "mark_decision_failed",
+                wraps=self.store.mark_decision_failed,
+            ) as mark_failed,
+        ):
+            with self.assertRaises(ProgrammingError):
+                self.run_scan(scanner)
+
+        mark_failed.assert_not_called()
+        self.assertEqual(
+            self.store.decision_status(decision_key(decision_ids[0])),
+            STATUS_PROCESSING,
+        )
+
+    def test_database_failure_while_recording_outcome_is_not_a_failed_decision(self) -> None:
+        decision_ids = self.load(count=1, page_size=1)
+        scanner = self.make_scanner()
+        error = ProgrammingError("outcome constraint mismatch")
+
+        with (
+            mock.patch.object(self.store, "record_decision_outcome", side_effect=error),
+            mock.patch.object(
+                self.store,
+                "mark_decision_failed",
+                wraps=self.store.mark_decision_failed,
+            ) as mark_failed,
+        ):
+            with self.assertRaises(ProgrammingError):
+                self.run_scan(scanner)
+
+        mark_failed.assert_not_called()
+        self.assertEqual(
+            self.store.decision_status(decision_key(decision_ids[0])),
+            STATUS_EXPORTED,
+        )
+
     def test_login_network_error_during_enumeration_pauses_and_resumes(self) -> None:
         decision_ids = self.load(count=2, page_size=2)
         scanner = self.make_scanner()

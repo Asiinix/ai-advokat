@@ -17,6 +17,7 @@ import time
 from ..catalog import sanitize_detail
 from ..http_client import SourceAuthError, SourceAuthNetworkError, SourceRateLimitError
 from .adapter import MAX_WORKERS, SotSource
+from .faults import is_database_error
 from .model import (
     OUTCOME_DONE,
     PHASE_ABORTED,
@@ -133,6 +134,8 @@ class SotScanner:
             enumeration_error = self._note_rate_limit(exc)
             print(f"[sot] {scan_id}: перечисление остановлено лимитом: {enumeration_error}")
         except Exception as exc:
+            if is_database_error(exc):
+                raise
             # A broken search page must not silently skip its decisions: stop
             # enumerating, still fetch what is already queued, resume later.
             enumeration_error = sanitize_detail(f"{type(exc).__name__}: {exc}")
@@ -370,6 +373,12 @@ class SotScanner:
         except (SourceAuthError, SourceRateLimitError):
             raise
         except Exception as exc:
+            # A store failure is never a decision failure. The Railway
+            # supervisor decides whether the psycopg error is transient or
+            # fatal; recording it here could corrupt a successfully exported
+            # decision into a failed one.
+            if is_database_error(exc):
+                raise
             outcome, failure_kind, http_status = classify_decision_failure(exc)
             self.store.mark_decision_failed(decision_key, sanitize_detail(str(exc)))
             self.store.record_decision_outcome(
