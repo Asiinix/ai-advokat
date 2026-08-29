@@ -15,6 +15,7 @@ from .config import (
     SOT_PASSWORD_ENV,
     SOT_USERNAME_ENV,
 )
+from .http_client import SourceAuthError, SourceAuthNetworkError, SourceRateLimitError
 from .sot import runtime as sot_runtime
 from .sot.model import (
     PHASE_ABORTED,
@@ -170,10 +171,33 @@ def load_scan_state(out_dir: str, scan_id: str, env: Mapping[str, str]) -> SotSc
 
 def rate_limit_wait_seconds(note: str | None, settings: AutoResumeSettings) -> float:
     delays = [float(value) for value in RATE_LIMIT_DELAY_RE.findall(note or "")]
-    requested = max(delays) if delays else settings.fallback_seconds
+    requested = max(delays) if delays else 0.0
+    return bounded_retry_wait_seconds(requested, settings)
+
+
+def bounded_retry_wait_seconds(requested: float, settings: AutoResumeSettings) -> float:
+    """Add the safety margin and keep every automatic wait operator-bounded."""
+    if requested <= 0:
+        requested = settings.fallback_seconds
     return min(
         settings.max_wait_seconds,
         max(MIN_WAIT_SECONDS, requested + settings.safety_seconds),
+    )
+
+
+def source_rate_limit_wait_seconds(
+    exc: SourceRateLimitError,
+    settings: AutoResumeSettings,
+) -> float:
+    return bounded_retry_wait_seconds(exc.rate_limit.delay(), settings)
+
+
+def run_supervised_cli(argv: list[str]) -> None:
+    """Run the CLI without erasing recoverable source errors into SystemExit."""
+    cli_main(
+        argv,
+        propagate_source_errors=True,
+        wait_when_exhausted=True,
     )
 
 
@@ -181,7 +205,7 @@ def supervise_sot_scan(
     command: str,
     *,
     env: Mapping[str, str] | None = None,
-    runner: Callable[[list[str]], object] = cli_main,
+    runner: Callable[[list[str]], object] = run_supervised_cli,
     state_loader: Callable[[str, str, Mapping[str, str]], SotScanState | None] = load_scan_state,
     sleeper: Callable[[float], object] = time.sleep,
 ) -> SotScanState:
@@ -199,6 +223,25 @@ def supervise_sot_scan(
     while True:
         try:
             runner(argv)
+        except SourceRateLimitError as exc:
+            delay = source_rate_limit_wait_seconds(exc, settings)
+            print(
+                "[railway] auto-resume: every PRG.SOT egress is temporarily "
+                f"quota-limited during login; next attempt in {delay:.0f}s"
+            )
+            sleeper(delay)
+            continue
+        except SourceAuthNetworkError:
+            print(
+                "[railway] auto-resume: every PRG.SOT egress is temporarily "
+                f"unreachable during login; next attempt in {settings.paused_seconds:.0f}s"
+            )
+            sleeper(settings.paused_seconds)
+            continue
+        except SourceAuthError as exc:
+            raise AutoResumeFatalError(
+                f"PRG.SOT credentials were rejected: {exc}"
+            ) from exc
         except SystemExit as exc:
             raise AutoResumeFatalError(f"sot-scan exited with code {exc.code}") from exc
         except Exception as exc:

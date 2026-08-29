@@ -27,6 +27,7 @@ from ai_advokat_parser.http_client import (
     RateLimitInfo,
     ResponseText,
     SourceAuthError,
+    SourceAuthNetworkError,
     SourceClient,
     SourceRateLimitError,
     SourceRequestError,
@@ -35,6 +36,7 @@ from ai_advokat_parser.sot import runtime as sot_runtime
 from ai_advokat_parser.sot.adapter import SotSource
 from ai_advokat_parser.sot.egress import (
     DEFAULT_COOLDOWN_SECONDS,
+    MAX_WAIT_SLICE_SECONDS,
     PARTITIONS_ENV,
     QUARANTINE_SECONDS,
     SotEgressPartition,
@@ -155,6 +157,7 @@ class ScriptedClient:
         self.lock = threading.Lock()
         self.last_rate_limit = RateLimitInfo()
         self.auth_step: bool | Exception = True
+        self.auth_calls = 0
 
     def answer(self, url: str):
         with self.lock:
@@ -173,6 +176,7 @@ class ScriptedClient:
         return self.answer(url)
 
     def authenticate(self) -> bool:
+        self.auth_calls += 1
         if isinstance(self.auth_step, Exception):
             raise self.auth_step
         return self.auth_step
@@ -351,7 +355,9 @@ class PoolQuarantineTest(unittest.TestCase):
     def test_network_auth_error_quarantines_and_fails_over(self) -> None:
         clock = FakeClock()
         pool, clients = make_pool(("a", "b"), clock)
-        clients["a"].script = [SourceAuthError("https://sot.invalid/login", "network error")]
+        clients["a"].script = [
+            SourceAuthNetworkError("https://sot.invalid/login", "network error")
+        ]
 
         payload, _ = pool.request_json("https://sot.invalid/api")
 
@@ -361,7 +367,10 @@ class PoolQuarantineTest(unittest.TestCase):
     def test_explicit_authentication_skips_a_dead_egress_partition(self) -> None:
         clock = FakeClock()
         pool, clients = make_pool(("a", "b"), clock)
-        clients["a"].auth_step = SourceAuthError("https://sot.invalid/login", "network error")
+        clients["a"].auth_step = SourceAuthNetworkError(
+            "https://sot.invalid/login",
+            "network error",
+        )
 
         self.assertTrue(pool.authenticate())
         self.assertEqual(pool._states[0].cooldown_until, clock.now + QUARANTINE_SECONDS)
@@ -483,6 +492,198 @@ class LoginRateLimitTest(unittest.TestCase):
             pool.request_json(f"{self.server.base_url}/api/search?page=1&size=2")
         self.assertIn("egress partitions are rate limited", str(ctx.exception))
 
+    def test_pool_login_uses_the_earliest_partition_reset(self) -> None:
+        clock = FakeClock()
+        pool, clients = make_pool(("a", "b"), clock)
+        clients["a"].auth_step = limited(120.0)
+        clients["b"].auth_step = limited(30.0)
+
+        with self.assertRaises(SourceRateLimitError) as ctx:
+            pool.authenticate()
+
+        self.assertIn("a", str(ctx.exception))
+        self.assertIn("b", str(ctx.exception))
+        self.assertEqual(ctx.exception.rate_limit.reset_at, clock.now + 30.0)
+        self.assertAlmostEqual(ctx.exception.rate_limit.delay(now=clock.now), 30.0)
+
+    def test_pool_login_without_reset_keeps_the_default_cooldown(self) -> None:
+        clock = FakeClock()
+        pool, clients = make_pool(("a", "b"), clock)
+        clients["a"].auth_step = limited(0.0)
+        clients["b"].auth_step = limited(0.0)
+
+        with self.assertRaises(SourceRateLimitError) as ctx:
+            pool.authenticate()
+
+        self.assertEqual(
+            ctx.exception.rate_limit.reset_at,
+            clock.now + DEFAULT_COOLDOWN_SECONDS,
+        )
+
+    def test_continuous_login_waits_for_the_first_recovering_route(self) -> None:
+        clock = FakeClock()
+        clients = {
+            partition_id: ScriptedClient(partition_id)
+            for partition_id in ("network", "quota")
+        }
+        partitions = tuple(SotEgressPartition(partition_id) for partition_id in clients)
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.now += seconds
+            clients["network"].auth_step = True
+
+        pool = SotEgressPool(
+            partitions,
+            lambda partition: clients[partition.partition_id],
+            time_source=clock,
+            sleeper=sleep,
+            wait_when_exhausted=True,
+        )
+        clients["network"].auth_step = SourceAuthNetworkError(
+            "https://sot.invalid/login",
+            "network error",
+        )
+        clients["quota"].auth_step = limited(600.0)
+
+        self.assertTrue(pool.authenticate())
+
+        self.assertEqual(sleeps, [QUARANTINE_SECONDS])
+        self.assertEqual(clients["network"].auth_calls, 2)
+        # Its 600-second Retry-After is retained in the same pool and is not
+        # probed again when the network route heals at 300 seconds.
+        self.assertEqual(clients["quota"].auth_calls, 1)
+
+    def test_continuous_login_still_surfaces_rejected_credentials(self) -> None:
+        clock = FakeClock()
+        pool, clients = make_pool(("a", "b"), clock)
+        pool._wait_when_exhausted = True
+        pool._sleep = mock.Mock()
+        clients["a"].auth_step = SourceAuthError(
+            "https://sot.invalid/login",
+            "login rejected",
+            status=200,
+        )
+
+        with self.assertRaises(SourceAuthError):
+            pool.authenticate()
+
+        pool._sleep.assert_not_called()
+
+    def test_continuous_login_surfaces_a_statusless_contract_error(self) -> None:
+        clock = FakeClock()
+        pool, clients = make_pool(("a", "b"), clock)
+        pool._wait_when_exhausted = True
+        pool._sleep = mock.Mock()
+        clients["a"].auth_step = SourceAuthError(
+            "https://sot.invalid/login",
+            "login page has no anti-forgery token",
+        )
+
+        with self.assertRaises(SourceAuthError):
+            pool.authenticate()
+
+        pool._sleep.assert_not_called()
+
+    def test_continuous_login_treats_retryable_http_status_as_temporary(self) -> None:
+        clock = FakeClock()
+        clients = {partition_id: ScriptedClient(partition_id) for partition_id in ("a", "b")}
+        partitions = tuple(SotEgressPartition(partition_id) for partition_id in clients)
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.now += seconds
+            clients["a"].auth_step = True
+
+        pool = SotEgressPool(
+            partitions,
+            lambda partition: clients[partition.partition_id],
+            time_source=clock,
+            sleeper=sleep,
+            wait_when_exhausted=True,
+        )
+        for client in clients.values():
+            client.auth_step = SourceAuthError(
+                "https://sot.invalid/login",
+                "temporary upstream failure",
+                status=503,
+            )
+
+        self.assertTrue(pool.authenticate())
+        self.assertEqual(sleeps, [QUARANTINE_SECONDS])
+
+    def test_long_login_cooldown_uses_heartbeat_slices_without_early_requests(self) -> None:
+        clock = FakeClock()
+        clients = {partition_id: ScriptedClient(partition_id) for partition_id in ("a", "b")}
+        partitions = tuple(SotEgressPartition(partition_id) for partition_id in clients)
+        sleeps: list[float] = []
+        reset_after = MAX_WAIT_SLICE_SECONDS * 2 + 30.0
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.now += seconds
+            if clock.now >= 1_000_000.0 + reset_after:
+                clients["a"].auth_step = True
+
+        pool = SotEgressPool(
+            partitions,
+            lambda partition: clients[partition.partition_id],
+            time_source=clock,
+            sleeper=sleep,
+            wait_when_exhausted=True,
+        )
+        clients["a"].auth_step = limited(reset_after)
+        clients["b"].auth_step = limited(reset_after + 600.0)
+
+        self.assertTrue(pool.authenticate())
+
+        self.assertEqual(
+            sleeps,
+            [MAX_WAIT_SLICE_SECONDS, MAX_WAIT_SLICE_SECONDS, 30.0],
+        )
+        self.assertEqual(clients["a"].auth_calls, 2)
+        self.assertEqual(clients["b"].auth_calls, 1)
+
+    def test_continuous_login_does_not_wait_for_missing_credentials(self) -> None:
+        clock = FakeClock()
+        pool, clients = make_pool(("a", "b"), clock)
+        pool._wait_when_exhausted = True
+        pool._sleep = mock.Mock()
+        clients["a"].auth_step = False
+        clients["b"].auth_step = False
+
+        self.assertFalse(pool.authenticate())
+        pool._sleep.assert_not_called()
+
+    def test_continuous_requests_wait_without_rebuilding_partition_cooldowns(self) -> None:
+        clock = FakeClock()
+        clients = {partition_id: ScriptedClient(partition_id) for partition_id in ("a", "b")}
+        partitions = tuple(SotEgressPartition(partition_id) for partition_id in clients)
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock.now += seconds
+
+        pool = SotEgressPool(
+            partitions,
+            lambda partition: clients[partition.partition_id],
+            time_source=clock,
+            sleeper=sleep,
+            wait_when_exhausted=True,
+        )
+        clients["a"].script = [limited(120.0)]
+        clients["b"].script = [limited(30.0)]
+
+        payload, _response = pool.request_json("https://sot.invalid/api")
+
+        self.assertEqual(payload["served_by"], "b")
+        self.assertEqual(sleeps, [30.0])
+        self.assertEqual(clients["a"].calls, 1)
+        self.assertEqual(clients["b"].calls, 2)
+
     def test_probe_auth_reports_a_throttled_login_as_a_rate_limit(self) -> None:
         code = sot_runtime.probe_auth(timeout=5, retries=2, login_url=self.server.login_url)
         self.assertEqual(code, 3)
@@ -505,6 +706,19 @@ class EgressBuilderTest(unittest.TestCase):
         client = self.build(clean_env())
         self.assertIsInstance(client, SourceClient)
         self.assertFalse(client.uses_proxy)
+
+    def test_continuous_single_partition_builds_a_waiting_pool(self) -> None:
+        client = build_sot_egress_client(
+            self.config,
+            timeout=5,
+            retries=1,
+            retry_delay=0,
+            login_url=self.server.login_url,
+            env=clean_env(),
+            wait_when_exhausted=True,
+        )
+
+        self.assertIsInstance(client, SotEgressPool)
 
     def test_single_proxy_partition_builds_one_proxied_client(self) -> None:
         env = clean_env(

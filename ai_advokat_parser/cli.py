@@ -404,12 +404,17 @@ def sot_config_overrides(args: argparse.Namespace) -> dict[str, object]:
     return {name: getattr(args, name, None) for name in SOT_CONFIG_ARGS}
 
 
-def run_sot_scan(args: argparse.Namespace) -> None:
+def run_sot_scan(args: argparse.Namespace, *, wait_when_exhausted: bool = False) -> None:
     """Validate the contract, then run one resumable pass over the corpus."""
     config = sot_runtime.load_config(sot_config_overrides(args))
     # Everything that could be wrong with the contract is rejected here, before
     # a store is opened and before a single row is written.
-    source = sot_runtime.build_source(config, timeout=args.timeout, retries=args.retries)
+    source = sot_runtime.build_source(
+        config,
+        timeout=args.timeout,
+        retries=args.retries,
+        wait_when_exhausted=wait_when_exhausted,
+    )
     if not source.client.authenticate():
         raise SotConfigError(
             "PRG.SOT scan needs a subscribed session: set "
@@ -463,7 +468,7 @@ def dump_sot_stubs(out_dir: str, scan_id: str, output: str) -> None:
     print(f"Заглушки скана {scan_id}: {len(payload['decisions'])} -> {path}", file=sys.stderr)
 
 
-def run_sot_command(args: argparse.Namespace) -> None:
+def run_sot_command(args: argparse.Namespace, *, wait_when_exhausted: bool = False) -> None:
     if args.command == "sot-status":
         sot_runtime.print_status(args.out, getattr(args, "scan_id", None))
         return
@@ -480,10 +485,10 @@ def run_sot_command(args: argparse.Namespace) -> None:
     if args.command == "sot-stubs":
         dump_sot_stubs(args.out, args.scan_id, args.output)
         return
-    run_sot_scan(args)
+    run_sot_scan(args, wait_when_exhausted=wait_when_exhausted)
 
 
-def run_args(args: argparse.Namespace) -> None:
+def run_args(args: argparse.Namespace, *, wait_when_exhausted: bool = False) -> None:
     if args.command in {None, "menu"}:
         run_menu(default_out=args.out)
         return
@@ -501,7 +506,7 @@ def run_args(args: argparse.Namespace) -> None:
         return
 
     if args.command in SOT_COMMANDS:
-        run_sot_command(args)
+        run_sot_command(args, wait_when_exhausted=wait_when_exhausted)
         return
 
     if args.command == "catalog-scan" and args.follow_links_depth > 0:
@@ -762,12 +767,22 @@ def run_menu(default_out: str = "data") -> None:
             print(f"Ошибка: {exc}")
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    propagate_source_errors: bool = False,
+    wait_when_exhausted: bool = False,
+) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        run_args(args)
-    except (SourceAuthError, SourceRateLimitError, SotConfigError, ValueError) as exc:
-        # SourceRateLimitError covers a login throttled on every egress
-        # partition: exit cleanly with the source's own wait, no traceback.
+        run_args(args, wait_when_exhausted=wait_when_exhausted)
+    except (SourceAuthError, SourceRateLimitError) as exc:
+        # The interactive CLI keeps its concise argparse-style error. The
+        # Railway supervisor, however, needs the concrete exception type to
+        # distinguish temporary quota/egress conditions from bad credentials.
+        if propagate_source_errors:
+            raise
+        parser.error(str(exc))
+    except (SotConfigError, ValueError) as exc:
         parser.error(str(exc))

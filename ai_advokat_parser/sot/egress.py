@@ -12,9 +12,10 @@ Two rules keep this safe:
   proxy credentials) is resolved from that separate variable and never appears
   in descriptors, errors, logs or diagnostics;
 - every per-partition quota answer is honoured exactly: a limited partition
-  rests until its own reset, and when every partition is resting the pool
-  raises one aggregate SourceRateLimitError carrying the earliest reset so the
-  scanner pauses instead of pushing through.
+  rests until its own reset. Ordinary callers receive one aggregate
+  SourceRateLimitError when all routes rest; the supervised corpus scan keeps
+  the same pool alive, sleeps until the earliest route recovers, and therefore
+  never forgets the longer cooldowns.
 
 The default is a single explicit direct partition. Source semantics stay the
 same, while ambient proxy variables are deliberately ignored so routing is
@@ -33,10 +34,12 @@ from dataclasses import dataclass
 from typing import Callable, Mapping
 
 from ..http_client import (
+    RETRYABLE_STATUSES,
     RateLimitInfo,
     ResponseText,
     SourceAccessDeniedError,
     SourceAuthError,
+    SourceAuthNetworkError,
     SourceClient,
     SourceRateLimitError,
     SourceRequestError,
@@ -54,6 +57,10 @@ DEFAULT_COOLDOWN_SECONDS = 60.0
 # error or its proxy demanding credentials). Long enough to stop hammering a
 # dead proxy, short enough that a transient outage heals within one run.
 QUARANTINE_SECONDS = 300.0
+# Long source resets are observed in bounded heartbeat slices. The pool keeps
+# the real cooldown timestamp and never contacts a resting partition early;
+# slicing only keeps the worker observable and interruptible.
+MAX_WAIT_SLICE_SECONDS = 300.0
 PROXY_AUTH_STATUS = 407
 
 DEFAULT_PARTITION_ID = "direct"
@@ -173,9 +180,14 @@ def _is_partition_local(exc: SourceRequestError) -> bool:
         return False
     if isinstance(exc, SourceAuthError):
         # A rejected login has an HTTP verdict (normally 200 with the login
-        # form, or 401) and is shared across partitions. A network failure or
-        # proxy-auth challenge is local to this egress path and may fail over.
-        return exc.status is None or exc.status == PROXY_AUTH_STATUS
+        # form, or 401) and is shared across partitions. Contract/security
+        # failures may also lack a status, so only the explicit network subtype,
+        # a proxy-auth challenge, or a retryable upstream status may fail over.
+        return (
+            isinstance(exc, SourceAuthNetworkError)
+            or exc.status == PROXY_AUTH_STATUS
+            or exc.status in RETRYABLE_STATUSES
+        )
     return exc.status is None or exc.status == PROXY_AUTH_STATUS
 
 
@@ -202,12 +214,16 @@ class SotEgressPool:
         partitions: tuple[SotEgressPartition, ...],
         client_factory: Callable[[SotEgressPartition], SourceClient],
         time_source: Callable[[], float] = time.time,
+        sleeper: Callable[[float], object] = time.sleep,
+        wait_when_exhausted: bool = False,
     ) -> None:
         enabled = [partition for partition in partitions if partition.enabled]
         if not enabled:
             raise SotConfigError("SotEgressPool needs at least one enabled partition.")
         self._states = [_PartitionState(partition, client_factory(partition)) for partition in enabled]
         self._time = time_source
+        self._sleep = sleeper
+        self._wait_when_exhausted = wait_when_exhausted
         self._lock = threading.Lock()
         self._current = 0
 
@@ -240,27 +256,52 @@ class SotEgressPool:
 
         A partition whose login is throttled rests until its own reset instead
         of failing the pool; only when no partition logged in at all does the
-        rate-limit error surface, so the caller still sees the quota verdict.
+        rate-limit error surface to an ordinary caller. The supervised scan
+        instead waits inside this pool, preserving every partition cooldown.
         """
-        result = False
-        limited: SourceRateLimitError | None = None
-        unavailable: SourceAuthError | None = None
-        for state in self._states:
-            try:
-                result = state.client.authenticate() or result
-            except SourceRateLimitError as exc:
-                self._mark_limited(state, exc.rate_limit)
-                limited = exc
-            except SourceAuthError as exc:
-                if not _is_partition_local(exc):
-                    raise
-                self._quarantine(state)
-                unavailable = exc
-        if not result and limited is not None:
-            raise limited
-        if not result and unavailable is not None:
-            raise unavailable
-        return result
+        while True:
+            available = self._available_states()
+            if not available:
+                if self._wait_when_exhausted:
+                    self._wait_for_next_partition("авторизация")
+                    continue
+                # A repeated explicit authenticate() while the pool is still
+                # cooling gets the same aggregate signal as a data request.
+                self._select(self._states[0].client.auth.login_url)
+                available = self._available_states()
+
+            result = False
+            unauthenticated = False
+            limited: SourceRateLimitError | None = None
+            limited_states: list[_PartitionState] = []
+            unavailable: SourceAuthError | None = None
+            for state in available:
+                try:
+                    authenticated = state.client.authenticate()
+                    result = authenticated or result
+                    unauthenticated = not authenticated or unauthenticated
+                except SourceRateLimitError as exc:
+                    self._mark_limited(state, exc.rate_limit)
+                    limited = exc
+                    limited_states.append(state)
+                except SourceAuthError as exc:
+                    if not _is_partition_local(exc):
+                        raise
+                    self._quarantine(state)
+                    unavailable = exc
+            if result:
+                return True
+            if unauthenticated:
+                # Missing credentials are configuration, not an egress outage.
+                return False
+            if self._wait_when_exhausted:
+                self._wait_for_next_partition("авторизация")
+                continue
+            if limited is not None:
+                raise self._aggregate_login_limit(limited, limited_states) from limited
+            if unavailable is not None:
+                raise unavailable
+            return False
 
     def request_json(
         self,
@@ -270,7 +311,13 @@ class SotEgressPool:
         headers: dict[str, str] | None = None,
     ):
         while True:
-            state = self._select(url)
+            try:
+                state = self._select(url)
+            except SourceRateLimitError:
+                if not self._wait_when_exhausted:
+                    raise
+                self._wait_for_next_partition("запрос")
+                continue
             try:
                 payload, response = state.client.request_json(
                     url, method=method, json_body=json_body, headers=headers
@@ -283,9 +330,11 @@ class SotEgressPool:
                     raise
                 self._quarantine(state)
                 if not self._any_available():
-                    # Nothing left to fail over to: surface the real failure
-                    # instead of dressing it up as a rate limit.
-                    raise
+                    if not self._wait_when_exhausted:
+                        # Nothing left to fail over to: surface the real
+                        # failure instead of dressing it up as a rate limit.
+                        raise
+                    self._wait_for_next_partition("запрос")
                 continue
             info = response.rate_limit
             if info.remaining is not None and info.remaining <= 0:
@@ -354,6 +403,59 @@ class SotEgressPool:
             print(f"[sot] egress: переключение на партицию {switched}")
         return selected
 
+    def _available_states(self) -> list[_PartitionState]:
+        now = self._time()
+        with self._lock:
+            available = []
+            for state in self._states:
+                if state.cooldown_until is not None and state.cooldown_until <= now:
+                    state.cooldown_until = None
+                if state.cooldown_until is None:
+                    available.append(state)
+            return available
+
+    def _wait_for_next_partition(self, stage: str) -> None:
+        now = self._time()
+        with self._lock:
+            waits = [
+                max(0.0, state.cooldown_until - now)
+                for state in self._states
+                if state.cooldown_until is not None
+            ]
+        # Every temporary failure records a positive cooldown. Keep a defensive
+        # one-second floor so a clock edge can never turn this into a busy loop.
+        remaining = min(waits) if waits else DEFAULT_COOLDOWN_SECONDS
+        delay = max(1.0, min(remaining, MAX_WAIT_SLICE_SECONDS))
+        print(
+            f"[sot] egress: все партиции временно недоступны ({stage}); "
+            f"следующая проверка через {delay:.0f}s"
+        )
+        self._sleep(delay)
+
+    def _aggregate_login_limit(
+        self,
+        limited: SourceRateLimitError,
+        limited_states: list[_PartitionState],
+    ) -> SourceRateLimitError:
+        """One quota signal with the earliest reset among throttled logins."""
+        now = self._time()
+        with self._lock:
+            resets = [
+                (state.descriptor.partition_id, state.cooldown_until)
+                for state in limited_states
+                if state.cooldown_until is not None
+            ]
+        earliest = min(reset for _partition_id, reset in resets)
+        described = ", ".join(
+            f"{partition_id} (reset-in {max(0.0, reset - now):.0f}s)"
+            for partition_id, reset in resets
+        )
+        return SourceRateLimitError(
+            limited.url,
+            f"No PRG.SOT egress partition could authenticate; quota-limited: {described}.",
+            RateLimitInfo(reset_at=earliest, remaining=0),
+        )
+
     def _mark_limited(self, state: _PartitionState, info: RateLimitInfo) -> None:
         now = self._time()
         delay = info.delay(now)
@@ -398,8 +500,9 @@ def build_sot_egress_client(
     retry_delay: float = 1.5,
     login_url: str | None = None,
     env: Mapping[str, str] | None = None,
+    wait_when_exhausted: bool = False,
 ) -> SourceClient | SotEgressPool:
-    """One SourceClient for the default direct partition, a pool otherwise.
+    """One SourceClient for ordinary direct use, a pool for routing or waiting.
 
     Proxy URLs are resolved here, before anything is opened or written, so a
     partition that names a missing variable fails the run loudly and early.
@@ -421,13 +524,18 @@ def build_sot_egress_client(
             proxy_url=resolved if resolved is not None else "",
         )
 
-    if len(enabled) == 1:
+    if len(enabled) == 1 and not wait_when_exhausted:
         return factory(enabled[0])
-    return SotEgressPool(tuple(enabled), factory)
+    return SotEgressPool(
+        tuple(enabled),
+        factory,
+        wait_when_exhausted=wait_when_exhausted,
+    )
 
 
 __all__ = [
     "DEFAULT_COOLDOWN_SECONDS",
+    "MAX_WAIT_SLICE_SECONDS",
     "PARTITIONS_ENV",
     "QUARANTINE_SECONDS",
     "SotEgressPartition",

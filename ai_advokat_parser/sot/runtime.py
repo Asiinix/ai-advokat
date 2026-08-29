@@ -64,6 +64,7 @@ def build_source(
     timeout: float = 30.0,
     retries: int = 3,
     login_url: str | None = None,
+    wait_when_exhausted: bool = False,
 ) -> SotSource:
     """Validate the contract first, then build the authenticated adapter.
 
@@ -71,7 +72,13 @@ def build_source(
     half-captured contract cannot create a scan row or take a lease.
     """
     config.validate()
-    client = build_sot_egress_client(config, timeout=timeout, retries=retries, login_url=login_url)
+    client = build_sot_egress_client(
+        config,
+        timeout=timeout,
+        retries=retries,
+        login_url=login_url,
+        wait_when_exhausted=wait_when_exhausted,
+    )
     return SotSource(client, config)
 
 
