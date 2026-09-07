@@ -391,7 +391,10 @@ class SourceClient:
         self._opener = urllib.request.build_opener(*handlers)
         self._auth_lock = threading.Lock()
         self._auth_generation = 0
-        self._login_failure: tuple[str, int | None] | None = None
+        # Keep whether the source reached an authentication verdict.  Replaying
+        # a transient network failure as a plain SourceAuthError would make the
+        # durable SOT supervisor treat it as rejected credentials and stop.
+        self._login_failure: tuple[bool, str, int | None] | None = None
         self._login_failed_at = 0.0
         self._last_rate_limit = RateLimitInfo()
         self._authenticated_landing: ResponseText | None = None
@@ -577,9 +580,15 @@ class SourceClient:
             try:
                 self._perform_login(self.credentials)
             except SourceAuthError as exc:
-                # Remember the rejection for a while: without it every queued
-                # document would fire its own login attempt at the source.
-                self._login_failure = (str(exc), exc.status)
+                # Remember the safe auth failure details for a while: without
+                # them every queued document would fire its own login attempt.
+                # Keep the network discriminator so a cached transport outage
+                # can never be replayed as rejected credentials.
+                self._login_failure = (
+                    isinstance(exc, SourceAuthNetworkError),
+                    str(exc),
+                    exc.status,
+                )
                 self._login_failed_at = time.monotonic()
                 raise
             self._login_failure = None
@@ -592,8 +601,9 @@ class SourceClient:
         if time.monotonic() - self._login_failed_at >= LOGIN_FAILURE_COOLDOWN:
             self._login_failure = None
             return
-        message, status = self._login_failure
-        raise SourceAuthError(self.auth.login_url, message, status=status)
+        is_network_error, message, status = self._login_failure
+        error_type = SourceAuthNetworkError if is_network_error else SourceAuthError
+        raise error_type(self.auth.login_url, message, status=status)
 
     def _perform_login(self, credentials: Credentials) -> None:
         self._authenticated_landing = None

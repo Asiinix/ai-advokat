@@ -15,6 +15,7 @@ from ai_advokat_parser.http_client import (
     Credentials,
     ResponseText,
     SourceAuthError,
+    SourceAuthNetworkError,
     SourceClient,
     credentials_from_env,
     parse_login_form,
@@ -285,8 +286,9 @@ class AuthenticatedClientTest(unittest.TestCase):
         url = f"{self.server.base_url}/mapi/api/Document/GetDocument/1/0"
 
         for _ in range(3):
-            with self.assertRaises(SourceAuthError):
+            with self.assertRaises(SourceAuthError) as ctx:
                 client.get_json(url)
+            self.assertNotIsInstance(ctx.exception, SourceAuthNetworkError)
         self.assertEqual(self.server.state.login_posts, 1)
 
         # Once the cooldown lapses the client is free to try again.
@@ -294,6 +296,27 @@ class AuthenticatedClientTest(unittest.TestCase):
         client._login_failed_at -= http_client.LOGIN_FAILURE_COOLDOWN
         self.assertTrue(client.get_json(url)["ok"])
         self.assertEqual(self.server.state.login_posts, 2)
+
+    def test_concurrent_cached_network_login_failure_stays_transient(self) -> None:
+        client = self.make_client()
+        failure = SourceAuthNetworkError(
+            client.auth.login_url,
+            "PRG login page request failed with a network error.",
+        )
+
+        with mock.patch.object(client, "_perform_login", side_effect=failure) as perform_login:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(client.authenticate) for _ in range(2)]
+
+            errors: list[SourceAuthError] = []
+            for future in futures:
+                with self.assertRaises(SourceAuthNetworkError) as ctx:
+                    future.result()
+                errors.append(ctx.exception)
+
+        self.assertEqual(perform_login.call_count, 1)
+        self.assertTrue(all(error.status is None for error in errors))
+        self.assertTrue(all(str(error) == str(failure) for error in errors))
 
     def test_login_page_instead_of_json_is_reported_as_auth_error(self) -> None:
         client = self.make_client(authenticated=False)

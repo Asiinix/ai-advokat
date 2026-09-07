@@ -4,11 +4,13 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ai_advokat_parser import cli, railway_worker
+from ai_advokat_parser import cli, http_client, railway_worker
 from ai_advokat_parser.http_client import (
+    Credentials,
     RateLimitInfo,
     SourceAuthError,
     SourceAuthNetworkError,
+    SourceClient,
     SourceRateLimitError,
 )
 from ai_advokat_parser.sot.model import (
@@ -265,6 +267,46 @@ class RailwaySotSupervisorTests(unittest.TestCase):
 
         self.assertEqual(runner.call_count, 3)
         self.assertEqual(sleeper.call_args_list, [mock.call(45.0), mock.call(45.0)])
+
+    def test_cached_client_network_failure_never_turns_fatal(self) -> None:
+        client = SourceClient(
+            credentials=Credentials("test-user", "test-password"),
+            retries=1,
+            retry_delay=0,
+        )
+        network_error = SourceAuthNetworkError(
+            client.auth.login_url,
+            "PRG login page request failed with a network error.",
+        )
+        sleeps: list[float] = []
+
+        def runner(_argv) -> None:
+            client.authenticate()
+
+        def sleeper(seconds: float) -> None:
+            sleeps.append(seconds)
+            # The first retry deliberately exercises the cached failure.  Only
+            # then expire it so the third run can perform a successful login.
+            if len(sleeps) == 2:
+                client._login_failed_at -= http_client.LOGIN_FAILURE_COOLDOWN
+
+        with mock.patch.object(
+            client,
+            "_perform_login",
+            side_effect=[network_error, None],
+        ) as perform_login:
+            result = railway_worker.supervise_sot_scan(
+                COMMAND,
+                env={railway_worker.AUTO_RESUME_PAUSED_ENV: "45"},
+                runner=runner,
+                state_loader=lambda *_: state(PHASE_COMPLETED),
+                sleeper=sleeper,
+            )
+
+        self.assertEqual(result.phase, PHASE_COMPLETED)
+        self.assertEqual(sleeps, [45.0, 45.0])
+        self.assertEqual(perform_login.call_count, 2)
+        self.assertTrue(client.authenticated)
 
     def test_rejected_login_is_fatal_and_not_retried(self) -> None:
         runner = mock.Mock(
