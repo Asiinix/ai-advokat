@@ -32,6 +32,7 @@ from ai_advokat_parser.http_client import (
     SourceRateLimitError,
 )
 from ai_advokat_parser.sot import CORPUS_TYPE, SOURCE_SYSTEM, decision_key
+from ai_advokat_parser.sot import runtime as sot_runtime
 from ai_advokat_parser.sot.adapter import SotSource, build_sot_client
 from ai_advokat_parser.sot.model import (
     OUTCOME_DONE,
@@ -173,6 +174,16 @@ class SotScanBase(unittest.TestCase):
     def run_scan(self, scanner: SotScanner, scan_id: str = "sot-1", **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
             return scanner.run(scan_id=scan_id, poll_interval=0, **kwargs)
+
+
+class SotWorkerLimitTest(SotScanBase):
+    def test_five_workers_are_accepted_by_scanner_and_runtime(self) -> None:
+        self.assertEqual(self.make_scanner(workers=5).workers, 5)
+        self.assertEqual(sot_runtime.resolve_workers(5), 5)
+
+    def test_worker_counts_above_five_are_capped(self) -> None:
+        self.assertEqual(self.make_scanner(workers=99).workers, 5)
+        self.assertEqual(sot_runtime.resolve_workers(99), 5)
 
 
 class SotSourceConfigTest(unittest.TestCase):

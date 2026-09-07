@@ -22,7 +22,7 @@ from .source_config import METADATA_FIELDS, SotSourceConfig, dotted_get, dotted_
 # The scan is a background bulk reader on a shared subscription, so it stays far
 # below anything a human session would produce.
 DEFAULT_WORKERS = 1
-MAX_WORKERS = 4
+MAX_WORKERS = 5
 
 
 @dataclass(frozen=True)
