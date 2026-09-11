@@ -31,6 +31,7 @@ from .config import (
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 RATE_LIMIT_STATUSES = frozenset({429})
 AUTH_STATUSES = frozenset({401})
+LOGIN_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 LOGIN_PATH_MARKER = "/account/login"
 LOGIN_FAILURE_COOLDOWN = 60.0
 LOGIN_BODY_MARKERS = ("__RequestVerificationToken", "PersonalDataAgreement")
@@ -90,8 +91,8 @@ class SourceAuthNetworkError(SourceAuthError):
     """Raised when PRG login failed before an authentication verdict.
 
     This is deliberately a ``SourceAuthError`` for backwards compatibility,
-    but SOT's durable scanner can distinguish a transient transport outage
-    from rejected credentials and pause for an automatic retry.
+    but SOT's durable scanner can distinguish a transient transport/protocol
+    failure from rejected credentials and pause for an automatic retry.
     """
 
 
@@ -612,7 +613,11 @@ class SourceClient:
                 self._perform_login_once(credentials)
                 return
             except SourceAuthError as exc:
-                transient = exc.status is None or exc.status in RETRYABLE_STATUSES
+                transient = (
+                    isinstance(exc, SourceAuthNetworkError)
+                    or exc.status is None
+                    or exc.status in RETRYABLE_STATUSES
+                )
                 if not transient or attempt >= self.retries:
                     raise
                 time.sleep(self.retry_delay * attempt)
@@ -683,6 +688,16 @@ class SourceClient:
                     self.auth.login_url,
                     f"PRG {stage} hit the source rate limit (HTTP {exc.code}): {rate_limit.describe()}.",
                     rate_limit,
+                    status=exc.code,
+                ) from exc
+            if exc.code in LOGIN_REDIRECT_STATUSES:
+                # urllib follows usable redirects itself. Receiving one here
+                # means the redirect was malformed, blocked or looped before
+                # PRG reached an authentication verdict. It is therefore a
+                # transient route/protocol failure, not rejected credentials.
+                raise SourceAuthNetworkError(
+                    self.auth.login_url,
+                    f"PRG {stage} returned an unusable redirect (HTTP {exc.code}).",
                     status=exc.code,
                 ) from exc
             raise SourceAuthError(

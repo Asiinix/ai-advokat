@@ -6,6 +6,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
 
 from ai_advokat_parser import cli, crawler as crawler_module, http_client, railway_worker
@@ -296,6 +297,30 @@ class AuthenticatedClientTest(unittest.TestCase):
         client._login_failed_at -= http_client.LOGIN_FAILURE_COOLDOWN
         self.assertTrue(client.get_json(url)["ok"])
         self.assertEqual(self.server.state.login_posts, 2)
+
+    def test_unusable_login_redirect_is_retried_and_stays_transient(self) -> None:
+        client = self.make_client()
+
+        def unusable_redirect(_request):
+            raise urllib.error.HTTPError(
+                client.auth.login_url,
+                302,
+                "Found",
+                {},
+                io.BytesIO(b"must-not-leak"),
+            )
+
+        with mock.patch.object(client, "_open", side_effect=unusable_redirect) as opener:
+            with self.assertRaises(SourceAuthNetworkError) as ctx:
+                client.authenticate()
+
+        self.assertEqual(opener.call_count, client.retries)
+        self.assertEqual(ctx.exception.status, 302)
+        rendered = f"{ctx.exception} {ctx.exception.args!r}"
+        self.assertIn("unusable redirect", rendered)
+        self.assertNotIn("must-not-leak", rendered)
+        self.assertNotIn(self.server.state.username, rendered)
+        self.assertNotIn(self.server.state.password, rendered)
 
     def test_concurrent_cached_network_login_failure_stays_transient(self) -> None:
         client = self.make_client()

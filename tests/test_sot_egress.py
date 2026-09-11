@@ -369,7 +369,8 @@ class PoolQuarantineTest(unittest.TestCase):
         pool, clients = make_pool(("a", "b"), clock)
         clients["a"].auth_step = SourceAuthNetworkError(
             "https://sot.invalid/login",
-            "network error",
+            "unusable redirect",
+            status=302,
         )
 
         self.assertTrue(pool.authenticate())

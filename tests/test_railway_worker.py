@@ -230,7 +230,11 @@ class RailwaySotSupervisorTests(unittest.TestCase):
     def test_login_network_failure_waits_and_reruns(self) -> None:
         runner = mock.Mock(
             side_effect=[
-                SourceAuthNetworkError("https://sot.invalid/login", "network error"),
+                SourceAuthNetworkError(
+                    "https://sot.invalid/login",
+                    "unusable redirect",
+                    status=302,
+                ),
                 None,
             ]
         )
