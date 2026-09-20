@@ -88,11 +88,12 @@ class SourceAuthError(SourceRequestError):
 
 
 class SourceAuthNetworkError(SourceAuthError):
-    """Raised when PRG login failed before an authentication verdict.
+    """Raised when PRG login failed without a trustworthy authentication verdict.
 
     This is deliberately a ``SourceAuthError`` for backwards compatibility,
     but SOT's durable scanner can distinguish a transient transport/protocol
-    failure from rejected credentials and pause for an automatic retry.
+    or session-establishment failure from rejected credentials and pause for
+    an automatic retry.
     """
 
 
@@ -663,8 +664,20 @@ class SourceClient:
                 f"{profile.return_url}. Check {profile.username_env}/{profile.password_env}.",
                 status=response.status,
             )
-        if not same_origin(response.url, profile.return_url) or not self._has_cookie_for(profile.return_url):
+        if not same_origin(response.url, profile.return_url):
             raise SourceAuthError(
+                profile.login_url,
+                f"PRG login returned an unexpected application origin instead of {profile.return_url}.",
+                status=response.status,
+            )
+        if not self._has_cookie_for(profile.return_url):
+            # Correct credentials are rejected above when PRG returns the
+            # login form.  A successful-looking landing on the expected
+            # application origin without its cookie is ambiguous: in
+            # production this can be caused by one egress route or an
+            # incomplete upstream response.  Treat it as transient so the
+            # client retries and the SOT pool can quarantine only that route.
+            raise SourceAuthNetworkError(
                 profile.login_url,
                 f"PRG login did not establish a session cookie for {profile.return_url}.",
                 status=response.status,

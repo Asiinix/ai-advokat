@@ -165,15 +165,16 @@ class AuthenticatedClientTest(unittest.TestCase):
         self.assertNotIn(self.server.state.username, rendered)
         self.assertNotIn(self.server.state.password, rendered)
 
-    def test_login_without_application_cookie_is_rejected(self) -> None:
+    def test_login_without_application_cookie_is_transient(self) -> None:
         self.server.state.omit_session_cookie = True
         client = self.make_client()
 
-        with self.assertRaises(SourceAuthError) as ctx:
+        with self.assertRaises(SourceAuthNetworkError) as ctx:
             client.authenticate()
 
         self.assertIn("session cookie", str(ctx.exception))
         self.assertFalse(client.authenticated)
+        self.assertEqual(self.server.state.login_posts, client.retries)
 
     def test_session_cookie_is_reused_for_follow_up_requests(self) -> None:
         client = self.make_client()
